@@ -1,0 +1,14 @@
+{
+  "name": "@kern/session-store",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Append-only JSONL session persistence with a branch tree.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@kern/protocol": "workspace:*"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "kern",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Kern — a minimal, from-first-principles terminal coding agent kernel",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "kern": "tsx packages/cli/src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
