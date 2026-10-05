@@ -1,0 +1,87 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.tsbuildinfo
+.DS_Store
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# TypeScript
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# Testing
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+
+# Logs
+logs/
+*.log
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Kern-specific
+.kern/
+.kern-cache/
+sessions/
+agent/sessions/
+*.jsonl.tmp
+
+# Temporary
+tmp/
+temp/
+**/.tmp/
+**/tmp/
+**/.cache/
+.cache/
+
+# Package manager
+.pnpm-store/
+node_modules/.cache/
+
+# Example output
+examples/output/
+
+# Compiled
+*.compiled.js
+*.map
+
+# Local overrides
+*.local
+.overrides.*.json
+
+# Agent artifacts
+.agents/*.log
+.agents/tmp/
+
+# Git
+.gitmodules.lock
