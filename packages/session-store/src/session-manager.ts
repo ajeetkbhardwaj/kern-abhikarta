@@ -8,6 +8,7 @@ export interface SessionState {
   children: Map<string, string[]>;
   activeLeafId: string;
   headerId: string;
+  lastSeq: number;
 }
 
 export interface LoadResult {
@@ -35,6 +36,7 @@ export class SessionManager {
       children: new Map(),
       activeLeafId: header.id,
       headerId: header.id,
+      lastSeq: 0,
     };
     mgr.filePath = filePath;
     return mgr;
@@ -72,7 +74,16 @@ export class SessionManager {
     if (!header || lastId === null) {
       throw new Error(`Session file missing header: ${filePath}`);
     }
-    this.state = { entries, children, activeLeafId: lastId, headerId: header.id };
+    let lastSeq = 0;
+    for (const e of entries.values()) {
+      if (typeof e.seq === "number" && e.seq > lastSeq) lastSeq = e.seq;
+    }
+    this.state = { entries, children, activeLeafId: lastId, headerId: header.id, lastSeq };
+    const { validateInvariants } = await import("./invariants.js");
+    const inv = validateInvariants(this.state);
+    if (!inv.valid) {
+      throw new Error(`Session invariants failed: ${inv.errors.join("; ")}`);
+    }
     this.filePath = filePath;
     this.logger.info("session_loaded", { filePath, entries: entries.size, leafId: lastId });
   }
@@ -80,6 +91,11 @@ export class SessionManager {
   get activeLeafId(): string {
     if (!this.state) throw new Error("SessionManager not initialized");
     return this.state.activeLeafId;
+  }
+
+  getEntry(id: string): SessionEntry | undefined {
+    if (!this.state) throw new Error("SessionManager not initialized");
+    return this.state.entries.get(id);
   }
 
   getActivePath(): SessionEntry[] {
@@ -117,11 +133,17 @@ export class SessionManager {
     this.logger.info("session_branch", { targetId });
   }
 
+  private nextSeq(): number {
+    if (!this.state) throw new Error("SessionManager not initialized");
+    this.state.lastSeq += 1;
+    return this.state.lastSeq;
+  }
+
   async appendUserMessage(text: string): Promise<MessageEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const msg: ChatMessage = { role: "user", content: [{ type: "text", text }], timestamp: now() };
     const parentId = this.state.activeLeafId;
-    const entry: MessageEntry = { id: newId("m"), parentId, timestamp: now(), type: "message", message: msg };
+    const entry: MessageEntry = { id: newId("m"), parentId, timestamp: now(), type: "message", message: msg, seq: this.nextSeq() };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(parentId) ?? [];
@@ -134,7 +156,7 @@ export class SessionManager {
   async appendAssistantMessage(msg: ChatMessage): Promise<MessageEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
-    const entry: MessageEntry = { id: newId("m"), parentId, timestamp: now(), type: "message", message: msg };
+    const entry: MessageEntry = { id: newId("m"), parentId, timestamp: now(), type: "message", message: msg, seq: this.nextSeq() };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(parentId) ?? [];
@@ -151,7 +173,7 @@ export class SessionManager {
   async appendCompaction(summary: string, replacesThroughId: string): Promise<CompactionEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
-    const entry: CompactionEntry = { id: newId("c"), parentId, timestamp: now(), type: "compaction", summary, replacesThroughId };
+    const entry: CompactionEntry = { id: newId("c"), parentId, timestamp: now(), type: "compaction", summary, replacesThroughId, seq: this.nextSeq() };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(parentId) ?? [];
@@ -161,10 +183,10 @@ export class SessionManager {
     return entry;
   }
 
-  async appendDiagnostic(d: Omit<DiagnosticEntry, "id" | "parentId" | "timestamp" | "type">): Promise<DiagnosticEntry> {
+  async appendDiagnostic(d: Omit<DiagnosticEntry, "id" | "parentId" | "timestamp" | "type" | "seq">): Promise<DiagnosticEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
-    const entry: DiagnosticEntry = { id: newId("d"), parentId, timestamp: now(), type: "diagnostic", ...d };
+    const entry: DiagnosticEntry = { id: newId("d"), parentId, timestamp: now(), type: "diagnostic", seq: this.nextSeq(), ...d };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(parentId) ?? [];
@@ -177,7 +199,7 @@ export class SessionManager {
   async appendBranch(note?: string): Promise<BranchEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const forkedFromId = this.state.activeLeafId;
-    const entry: BranchEntry = { id: newId("b"), parentId: forkedFromId, timestamp: now(), type: "branch", forkedFromId, note };
+    const entry: BranchEntry = { id: newId("b"), parentId: forkedFromId, timestamp: now(), type: "branch", forkedFromId, note, seq: this.nextSeq() };
     await this.store.append(this.filePath, entry);
     this.state.entries.set(entry.id, entry);
     const arr = this.state.children.get(forkedFromId) ?? [];

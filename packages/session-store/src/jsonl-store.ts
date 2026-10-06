@@ -1,29 +1,23 @@
-import { createLogger, newId, newSessionId, now, type Logger } from "@kern/protocol";
+import { createLogger, newId, newSessionId, now, type Logger, safeValidateSessionEntry } from "@kern/protocol";
 import type { SessionEntry, SessionHeaderEntry, MessageEntry, CompactionEntry, DiagnosticEntry, LabelEntry, BranchEntry, ExtensionEntry, ModelChangeEntry } from "@kern/protocol";
 import { SESSION_ENTRY_VERSION } from "@kern/protocol";
-import { mkdir, readFile, appendFile, stat, readdir, writeFile } from "node:fs/promises";
+import { mkdir, appendFile, stat, readdir } from "node:fs/promises";
 import { join, dirname, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 
 export interface SessionStoreOptions {
-  /** Override default storage root (~/.kern/agent/sessions) */
   storageRoot?: string;
-  /** Override session directory layout mapping (defaults to cwd path encoding). */
   sessionDirEncoder?: (cwd: string) => string;
   logger?: Logger;
+  validateOnLoad?: boolean;
+  quarantineLastMalformed?: boolean;
 }
 
 export interface CreateSessionOptions {
   cwd: string;
   meta?: Record<string, unknown>;
-}
-
-export interface LoadSessionOptions {
-  cwd: string;
-  sessionId?: string;
-  recent?: boolean;
 }
 
 export interface SessionFile {
@@ -34,12 +28,7 @@ export interface SessionFile {
   size: number;
 }
 
-export interface SessionManifestEntry {
-  filePath: string;
-  sessionId: string;
-  createdAt: string;
-  mtimeMs: number;
-  size: number;
+export interface SessionManifestEntry extends SessionFile {
   cwd: string;
   leafId?: string;
 }
@@ -48,11 +37,15 @@ export class SessionStore {
   private readonly storageRoot: string;
   private readonly logger: Logger;
   private readonly sessionDirEncoder: (cwd: string) => string;
+  private readonly validateOnLoad: boolean;
+  private readonly quarantineLastMalformed: boolean;
 
   constructor(options: SessionStoreOptions = {}) {
     this.storageRoot = options.storageRoot ?? join(homedir(), ".kern", "agent", "sessions");
     this.logger = options.logger ?? createLogger("info");
     this.sessionDirEncoder = options.sessionDirEncoder ?? encodeSessionDir;
+    this.validateOnLoad = options.validateOnLoad ?? true;
+    this.quarantineLastMalformed = options.quarantineLastMalformed ?? true;
   }
 
   async ensureRoot(): Promise<void> {
@@ -96,27 +89,51 @@ export class SessionStore {
     if (!existsSync(filePath)) return;
     const stream = createReadStream(filePath, { encoding: "utf8" });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    const lines: string[] = [];
     for await (const line of rl) {
+      lines.push(line);
+    }
+    const total = lines.length;
+    for (let i = 0; i < total; i++) {
+      const line = lines[i]!;
       const trimmed = line.trim();
       if (trimmed.length === 0) continue;
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(trimmed) as SessionEntry;
-        yield parsed;
+        parsed = JSON.parse(trimmed);
       } catch (error) {
-        this.logger.warn("jsonl_malformed_line", { filePath, error });
+        if (this.quarantineLastMalformed && i === total - 1) {
+          this.logger.warn("jsonl_malformed_trailing_quarantined", { filePath });
+          continue;
+        }
+        this.logger.warn("jsonl_malformed_line_skipped", { filePath });
         continue;
       }
+      if (this.validateOnLoad) {
+        const v = safeValidateSessionEntry(parsed);
+        if (!v.success) {
+          if (this.quarantineLastMalformed && i === total - 1) {
+            this.logger.warn("jsonl_invalid_trailing_quarantined", { filePath });
+            continue;
+          }
+          this.logger.warn("jsonl_invalid_line_skipped", { filePath });
+          continue;
+        }
+        yield v.data as SessionEntry;
+        continue;
+      }
+      yield parsed as SessionEntry;
     }
   }
 
   async listSessions(cwd: string, options: { limit?: number } = {}): Promise<SessionFile[]> {
     const dir = this.sessionDirFor(cwd);
+    let names: string[] = [];
     try {
-      const names = await readdir(dir);
+      names = await readdir(dir);
     } catch {
       return [];
     }
-    const names = await readdir(dir).catch(() => []);
     const files: SessionFile[] = [];
     for (const name of names) {
       if (!name.endsWith(".jsonl")) continue;
@@ -124,12 +141,10 @@ export class SessionStore {
       const st = await stat(filePath).catch(() => null);
       if (!st || !st.isFile()) continue;
       const sid = extractSessionId(name);
-      const sessionId = sid === null || sid === undefined ? "" : sid;
-      const createdAtRaw = extractCreatedAt(name);
-      const createdAt = createdAtRaw === null ? st.mtime.toISOString() : createdAtRaw;
-      const sid2 = extractSessionId(name);
-      const sessionIdOut = sid2 === null ? "" : sid2;
-      files.push({ filePath, sessionId: sessionIdOut, createdAt, mtimeMs: st.mtimeMs, size: st.size });
+      const sessionId = sid === null ? "" : sid;
+      const ca = extractCreatedAt(name);
+      const createdAt = ca === null ? st.mtime.toISOString() : ca;
+      files.push({ filePath, sessionId, createdAt, mtimeMs: st.mtimeMs, size: st.size });
     }
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     if (options.limit) return files.slice(0, options.limit);

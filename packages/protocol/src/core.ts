@@ -28,7 +28,7 @@ export interface ToolCallBlock {
   /** Provider-assigned id. Unique within one assistant message. */
   id: string;
   name: string;
-  arguments: unknown;
+  arguments?: unknown;
 }
 
 export interface ToolResultBlock {
@@ -73,6 +73,8 @@ export interface BaseEntry {
   parentId: string | null;
   /** ISO-8601. */
   timestamp: string;
+  /** Monotonic sequence index (assigned on append). */
+  seq?: number;
 }
 
 export interface SessionHeaderEntry extends BaseEntry {
