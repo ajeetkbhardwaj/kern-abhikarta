@@ -60,7 +60,7 @@ export const PROVIDER_PRESETS: Array<{ name: string; baseUrl: string; apiKeyEnv:
   { name: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", hint: "cloud · key required" },
   { name: "ollama", baseUrl: "http://localhost:11434/v1", apiKeyEnv: "", hint: "local · no key" },
   { name: "lmstudio", baseUrl: "http://localhost:1234/v1", apiKeyEnv: "", hint: "local · no key" },
-  { name: "vllm", baseUrl: "http://localhost:8000/v1", apiKeyEnv: "", hint: "local · key only if server sets one" },
+  { name: "llamacpp", baseUrl: "http://localhost:8080/v1", apiKeyEnv: "", hint: "local · llama-server, no key" },
   { name: "nvidia", baseUrl: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", hint: "cloud · key required" },
 ];
 

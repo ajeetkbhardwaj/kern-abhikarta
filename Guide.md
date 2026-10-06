@@ -29,7 +29,8 @@ pnpm kern --help
 ## 2. Connect a model (cloud or local)
 
 Kern talks to any **OpenAI-compatible endpoint** — OpenAI, OpenRouter,
-Ollama, LM Studio, vLLM, and most proxies. No provider-specific code.
+NVIDIA, Ollama, LM Studio, llama.cpp, and most proxies. No
+provider-specific code.
 
 ### Option A — config file (recommended)
 
