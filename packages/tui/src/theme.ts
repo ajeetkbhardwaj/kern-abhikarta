@@ -39,7 +39,4 @@ export const theme: Theme = {
   bold: paint("1"),
 };
 
-export const HIDE_CURSOR = `${ESC}?25l`;
-export const SHOW_CURSOR = `${ESC}?25h`;
-export const CLEAR_LINE = `${ESC}2K\r`;
 export const CLEAR_SCREEN = `${ESC}2J${ESC}H`;

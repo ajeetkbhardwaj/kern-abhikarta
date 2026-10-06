@@ -1,35 +1,27 @@
 /**
- * @kern/tui — interactive orchestrator on the pi-tui framework.
+ * @kern/tui — interactive orchestrator on our own component framework.
  *
- * Main-screen renderer (native scrollback), transcript Container, Markdown
- * streaming with syntax highlighting, Editor with slash/file completion,
+ * Main-screen renderer (native scrollback), transcript Container, streaming
+ * Markdown with syntax highlighting, Editor with slash/file completion,
  * SelectList overlays for approvals / model picker / history, Loader
- * spinner while busy. The TUI observes `AgentEvent`s and acts only through
- * the `AgentSession` API — all kernel guarantees hold unchanged.
+ * spinner while busy. Observes `AgentEvent`s; acts only via `AgentSession`.
  */
 
 import { writeFile, readFile, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import {
-  ProcessTerminal,
-  TuiMainScreen,
-  Container,
-  Text,
-  Editor,
-  Markdown,
-  SelectList,
-  CombinedAutocompleteProvider,
-  Spacer,
-  Loader,
-  matchesKey,
-  type TUI,
-} from "@earendil-works/pi-tui";
 import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
 import { createAdapterFor, discoverModels, type ModelsFile } from "@kern/model";
 import { theme } from "./theme.js";
+import { Screen } from "./screen.js";
+import { Container, Text, Spacer } from "./components.js";
+import { Editor, defaultEditorTheme } from "./editor.js";
+import { SelectList, Loader, defaultSelectListTheme } from "./select-list.js";
+import { Markdown, defaultMarkdownTheme } from "./markdown.js";
+import { KernAutocomplete } from "./autocomplete.js";
+import { matchesKey } from "./keys.js";
 
 export interface InteractiveOptions {
   session: AgentSession;
@@ -46,7 +38,7 @@ export interface InteractiveOptions {
   approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session">) | null };
 }
 
-const COMMANDS: Array<{ name: string; description: string }> = [
+const COMMANDS = [
   { name: "help", description: "show this list" },
   { name: "model", description: "pick provider/model (auto-listed)" },
   { name: "compact", description: "summarize history into a checkpoint" },
@@ -61,57 +53,7 @@ const COMMANDS: Array<{ name: string; description: string }> = [
 const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · Ctrl+C abort";
 const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
-const INVISIBLE_RE = /[‌‎‏‪-‮⁠-⁤﻿]/gu;
-
-const editorTheme = {
-  borderColor: theme.muted,
-  selectList: {
-    selectedPrefix: theme.accent,
-    selectedText: theme.bold,
-    description: theme.muted,
-    scrollInfo: theme.muted,
-    noMatch: theme.muted,
-  },
-};
-
-const mdTheme = {
-  heading: (s: string) => theme.accent(theme.bold(s)),
-  link: (s: string) => `\u001b[4;36m${s}\u001b[0m`,
-  linkUrl: theme.muted,
-  code: theme.tool,
-  codeBlock: (s: string) => s,
-  codeBlockBorder: theme.muted,
-  quote: theme.muted,
-  quoteBorder: theme.muted,
-  hr: theme.muted,
-  listBullet: theme.accent,
-  bold: theme.bold,
-  italic: (s: string) => `\u001b[3m${s}\u001b[0m`,
-  strikethrough: (s: string) => `\u001b[9m${s}\u001b[0m`,
-  underline: (s: string) => `\u001b[4m${s}\u001b[0m`,
-  highlightCode,
-};
-
-/** Minimal keyword/string/comment/number highlighter for fenced code. */
-function highlightCode(code: string): string[] {
-  const keywords =
-    /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|class|extends|import|from|export|default|async|await|try|catch|finally|throw|typeof|interface|type|enum|def|elif|fn|struct|impl|match|use|pub|echo|then|fi|do|done|null|true|false|None|True|False)\b/g;
-  return code.split("\n").map((line) => {
-    const comment = line.match(/(\/\/|#|--).*$/);
-    let body = line;
-    let tail = "";
-    if (comment && !/^(\s* погрешность)/.test(line)) {
-      const idx = comment.index ?? line.length;
-      tail = theme.muted(line.slice(idx));
-      body = line.slice(0, idx);
-    }
-    body = body
-      .replace(/("[^"]*"|'[^']*'|`[^`]*`)/g, (m) => theme.tool(m))
-      .replace(keywords, (m) => theme.accent(m))
-      .replace(/\b(\d[\d._]*)\b/g, (m) => `\u001b[33m${m}\u001b[0m`);
-    return body + tail;
-  });
-}
+const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
 
 export async function runInteractive(options: InteractiveOptions): Promise<void> {
   const logger = options.logger ?? nullLogger;
@@ -122,17 +64,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   }
   const cwd = resolve(options.cwd);
 
-  const terminal = new ProcessTerminal();
-  const tui: TUI = new TuiMainScreen(terminal);
+  const screen = new Screen();
   const transcript = new Container();
   const status = new Text("", 0, 0);
-  const editor = new Editor(tui, editorTheme);
-  editor.setAutocompleteProvider(new CombinedAutocompleteProvider(COMMANDS, cwd));
+  const editor = new Editor("› ");
+  const autocomplete = new KernAutocomplete(COMMANDS, cwd);
+  editor.setAutocompleteProvider(autocomplete);
+  await autocomplete.refreshFiles();
 
-  tui.addChild(transcript);
-  tui.addChild(status);
-  tui.addChild(editor);
-  tui.setFocus(editor);
+  screen.addChild(transcript);
+  screen.addChild(status);
+  screen.addChild(editor);
+  screen.setFocus(editor);
 
   let busy = false;
   let abort: AbortController | null = null;
@@ -140,7 +83,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let unsubscribe: (() => void) | null = null;
   let activity = "thinking";
   let loader: Loader | null = null;
-  let loaderMsg = "thinking";
   let queue: string[] = [];
   let lastExitAttempt = 0;
   let stash = "";
@@ -148,7 +90,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const say = (text: string) => {
     transcript.addChild(new Text(text, 0, 0));
-    tui.requestRender();
+    screen.requestRender();
   };
   const info = (text: string) => say(theme.muted(text));
   const err = (text: string) => say(theme.error(text));
@@ -157,8 +99,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const setBusy = (running: boolean) => {
     busy = running;
     if (running) {
-      loaderMsg = activity;
-      loader = new Loader(tui, theme.accent, theme.muted, loaderMsg);
+      loader = new Loader(() => screen.requestRender(), activity);
       transcript.addChild(loader);
       loader.start();
     } else if (loader) {
@@ -166,7 +107,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       transcript.removeChild(loader);
       loader = null;
     }
-    tui.requestRender();
+    screen.requestRender();
   };
 
   const modeLabel = () => (session.approvalMode() === "ask" ? "manual" : session.approvalMode());
@@ -184,7 +125,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const usage = session.contextUsage();
     const ctx = usage ? ` · ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "";
     status.setText(theme.muted(`— ${m.provider}/${m.modelId} · ${modeLabel()} · ${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s${ctx}`));
-    tui.requestRender();
+    screen.requestRender();
   };
 
   // --- event → transcript -----------------------------------------------------
@@ -204,12 +145,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           if (!md) {
             say(theme.bold("assistant"));
             mdText = "";
-            md = new Markdown("", 0, 0, mdTheme);
+            md = new Markdown("", defaultMarkdownTheme);
             transcript.addChild(md);
           }
           mdText += event.delta;
           md.setText(mdText);
-          tui.requestRender();
+          screen.requestRender();
           break;
         case "reasoning_delta":
           activity = "thinking";
@@ -218,7 +159,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         case "message_end":
           closeAssistant();
           transcript.addChild(new Spacer(1));
-          tui.requestRender();
+          screen.requestRender();
           break;
         case "tool_execution_start":
           closeAssistant();
@@ -228,6 +169,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           break;
         case "tool_execution_end":
           say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
+          break;
+        case "tool_execution_update":
+          activity = `running ${event.toolName}`;
+          if (loader) loader.setMessage(activity);
           break;
         case "auto_compaction_start":
           activity = "compacting context";
@@ -263,27 +208,27 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   ): Promise<boolean | "session"> => {
     const tool = meta?.toolName ?? "tool";
     const picked = await new Promise<string | null>((resolve) => {
-      const list = new SelectList(
+      const list = new SelectList<string>(
+        `Approval: ${tool} — ${prompt}`,
         [
           { value: "once", label: "Yes, run once" },
           { value: "session", label: `Yes, always allow ${tool} this session` },
           { value: "no", label: "No" },
         ],
         5,
-        editorTheme.selectList,
+        defaultSelectListTheme,
       );
       list.onSelect = (item) => {
-        tui.hideOverlay();
-        tui.setFocus(editor);
+        screen.hideOverlay();
+        screen.setFocus(editor);
         resolve(item.value);
       };
       list.onCancel = () => {
-        tui.hideOverlay();
-        tui.setFocus(editor);
+        screen.hideOverlay();
+        screen.setFocus(editor);
         resolve(null);
       };
-      say(theme.warn(`Approval: ${tool} — ${prompt}`));
-      tui.showOverlay(list);
+      screen.showOverlay(list);
     });
     if (picked === "session") {
       ok(`Always allowing ${tool} for this session.`);
@@ -352,19 +297,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- overlays: model picker, history -------------------------------------------------
-  const withOverlay = async <T>(list: SelectList, onPick: (value: string) => Promise<void> | void): Promise<void> => {
+  const withOverlay = async (list: SelectList<string>, onPick: (value: string) => Promise<void> | void): Promise<void> => {
     await new Promise<void>((resolve) => {
       list.onSelect = (item) => {
-        tui.hideOverlay();
-        tui.setFocus(editor);
+        screen.hideOverlay();
+        screen.setFocus(editor);
         void Promise.resolve(onPick(item.value)).finally(() => resolve());
       };
       list.onCancel = () => {
-        tui.hideOverlay();
-        tui.setFocus(editor);
+        screen.hideOverlay();
+        screen.setFocus(editor);
         resolve();
       };
-      tui.showOverlay(list);
+      screen.showOverlay(list);
     });
   };
 
@@ -389,7 +334,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return;
     }
     const current = session.modelInfo();
-    const list = new SelectList(
+    const list = new SelectList<string>(
+      "model",
       [...models]
         .sort((a, b) => Number(b.authenticated) - Number(a.authenticated))
         .map((m) => ({
@@ -398,7 +344,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           description: `${m.source}${m.authenticated ? "" : " · no credentials"}`,
         })),
       10,
-      editorTheme.selectList,
+      defaultSelectListTheme,
     );
     if (initialFilter) list.setFilter(initialFilter);
     await withOverlay(list, async (value) => {
@@ -423,15 +369,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const historySearch = async () => {
     if (busy) return;
-    const items = recentPrompts.length > 0 ? recentPrompts : [];
-    if (items.length === 0) {
+    if (recentPrompts.length === 0) {
       info("No history yet.");
       return;
     }
-    const list = new SelectList(
-      [...items].reverse().map((h) => ({ value: h, label: h.length > 100 ? h.slice(0, 100) + "…" : h })),
+    const list = new SelectList<string>(
+      "history",
+      [...recentPrompts].reverse().map((h) => ({ value: h, label: h.length > 100 ? h.slice(0, 100) + "…" : h })),
       10,
-      editorTheme.selectList,
+      defaultSelectListTheme,
     );
     await withOverlay(list, (value) => editor.setText(value));
   };
@@ -512,6 +458,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           manager = fresh.manager;
           queue = [];
           subscribe();
+          await autocomplete.refreshFiles();
           transcript.clear();
           printHeader();
           printStatus();
@@ -539,7 +486,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }
   };
 
-  // --- prompt submission --------------------------------------------------------------------
+  // --- prompt submission ---------------------------------------------------------------------
   const runTurn = (text: string) => {
     busy = true;
     abort = new AbortController();
@@ -558,6 +505,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         abort = null;
         if (!exiting) {
           printStatus();
+          void autocomplete.refreshFiles();
           const next = queue.shift();
           if (next !== undefined) {
             info(`[sending queued message${queue.length > 0 ? ` (+${queue.length} more)` : ""}]`);
@@ -597,6 +545,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const raw = line.replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
     if (!raw.trim()) return;
     const trimmed = raw.trim();
+    editor.clear();
+    screen.requestRender();
     if (trimmed === "?") {
       void runCommand("/help");
       return;
@@ -618,7 +568,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         } catch (error) {
           err(String(error));
         }
-        if (!keep) void exit();
+        if (!keep) exit();
       })();
       return;
     }
@@ -649,8 +599,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     options.approvalHook.current = null;
     unsubscribe?.();
     say(theme.muted("bye."));
-    tui.renderNow(true);
-    tui.stop();
+    screen.renderNow();
+    screen.stop();
     process.exit(0);
   };
 
@@ -665,9 +615,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- global keys ----------------------------------------------------------------------------
-  tui.addInputListener((data) => {
-    if (tui.hasOverlay()) return undefined; // overlays own Esc/arrows/Enter
-    if (matchesKey(data, "ctrl+c")) {
+  screen.setInputHook((key) => {
+    if (screen.hasOverlay()) return undefined; // overlays own Esc/arrows/Enter
+    if (matchesKey(key, "ctrl+c")) {
       if (busy) {
         abort?.abort();
         return { consume: true };
@@ -676,28 +626,24 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       else editor.setText("");
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+d")) {
+    if (matchesKey(key, "ctrl+d")) {
       if (editor.getText().length === 0) requestExit();
       return editor.getText().length === 0 ? { consume: true } : undefined;
     }
-    if (matchesKey(data, "ctrl+s")) {
-      if (editor.getText().length > 0) {
-        stash = editor.getText();
-        editor.setText("");
-      } else if (stash) {
-        editor.setText(stash);
-      }
+    if (matchesKey(key, "ctrl+s")) {
+      editor.stashPrompt();
+      screen.requestRender();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+r")) {
+    if (matchesKey(key, "ctrl+r")) {
       if (!busy) void historySearch();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+l")) {
-      tui.requestRender(true);
+    if (matchesKey(key, "ctrl+l")) {
+      screen.requestRender();
       return { consume: true };
     }
-    if (matchesKey(data, "shift+tab")) {
+    if (matchesKey(key, "shift+tab")) {
       if (!busy) cycleMode();
       return { consume: true };
     }
@@ -706,7 +652,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   printHeader();
   printStatus();
-  tui.start();
+  screen.start();
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (exiting) {
