@@ -22,13 +22,11 @@ branch preservation, resume reconstruction).
 
 ## 7.2 Missing (in priority order)
 
-1. **Real endpoint run.** The OpenAI-compatible adapter
-   (`@kern/model`: streaming, `reasoning_content`, fragmented tool args,
-   usage normalization, HTTP→`KernError` classification, `/models`
-   discovery) is implemented and verified against a mock server plus a
-   full kernel turn; CLI supports `--model/--api-key/--base-url/--nvidia/
-   --list-models` and interactive `/model` switching (persisted as
-   `model_change`). Still needs a run against a real endpoint with a key.
+1. **Real model adapter.** `packages/model` is an empty scaffold; the fake
+   model is the default. One provider adapter (OpenAI first) against the
+   existing `ModelAdapter` contract is the single highest-value step — it
+   tests the riskiest boundary (streaming arg fragments, usage fields, stop
+   reasons, malformed calls) with reality.
 2. **Real tokenizer.** Char-based estimation is an explicit placeholder;
    replace with a true counter or provider `usage`-driven accounting.
 3. **Persistent tests.** `vitest` is configured, zero test files exist.

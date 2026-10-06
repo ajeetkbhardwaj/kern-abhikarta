@@ -1,1 +1,2 @@
-export * from "./openai-compatible.js";
+export * from "./openai.js";
+export * from "./discovery.js";

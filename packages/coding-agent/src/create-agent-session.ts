@@ -37,8 +37,6 @@ export interface AgentSession {
   prompt(text: string, opts?: { signal?: AbortSignal }): Promise<void>;
   subscribe(listener: AgentEventListener): () => void;
   budgetUsage(): { turns: number; totalToolCalls: number; wallTimeMs: number };
-  compact(instructions?: string): Promise<{ summary: string; replacesThroughId: string }>;
-  setModel(adapter: ModelAdapter): Promise<void>;
 }
 
 export async function createAgentSession(
@@ -97,8 +95,6 @@ export async function createAgentSession(
     prompt: (text, opts) => runtime.runUserTurn(text, opts ?? {}),
     subscribe: (l) => events.subscribe(l),
     budgetUsage: () => runtime.budgetUsage(),
-    compact: (instructions) => runtime.compact(instructions),
-    setModel: (adapter) => runtime.setModel(adapter),
   };
   return { session, manager };
 }
