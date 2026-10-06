@@ -55,11 +55,102 @@ export interface DiscoveredModel {
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const DEFAULT_MAX_OUTPUT = 4_000;
 
+export const PROVIDER_PRESETS: Array<{ name: string; baseUrl: string; apiKeyEnv: string; hint: string }> = [
+  { name: "openai", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", hint: "cloud · key required" },
+  { name: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", hint: "cloud · key required" },
+  { name: "ollama", baseUrl: "http://localhost:11434/v1", apiKeyEnv: "", hint: "local · no key" },
+  { name: "lmstudio", baseUrl: "http://localhost:1234/v1", apiKeyEnv: "", hint: "local · no key" },
+  { name: "vllm", baseUrl: "http://localhost:8000/v1", apiKeyEnv: "", hint: "local · key only if server sets one" },
+  { name: "nvidia", baseUrl: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", hint: "cloud · key required" },
+];
+
+export function userModelsFile(): string {
+  return join(homedir(), ".kern", "models.json");
+}
+
+/** Test a base URL + key, returning friendly failures (never throws raw). */
+export async function testProvider(
+  baseUrl: string,
+  apiKey: string | undefined,
+  options: ListModelsOptions = {},
+): Promise<{ ok: true; models: string[] } | { ok: false; message: string }> {
+  let normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(normalized)) {
+    return { ok: false, message: `Bad URL ${JSON.stringify(baseUrl)} — must start with http:// or https://.` };
+  }
+  try {
+    const models = await listRemoteModels(normalized, apiKey, { timeoutMs: 10_000, ...options });
+    return { ok: true, models };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (/ENOTFOUND|ECONNREFUSED|EHOSTUNREACH/i.test(msg)) {
+      return { ok: false, message: `Can't reach ${normalized}. Is the server running?` };
+    }
+    if (/HTTP 401|HTTP 403/.test(msg)) {
+      return { ok: false, message: `Key rejected (HTTP 401). Check the key, $VAR, or command output.` };
+    }
+    if (/abort|timeout|timed out/i.test(msg)) {
+      return { ok: false, message: `Timed out after 10s — behind a proxy/VPN, or wrong host?` };
+    }
+    return { ok: false, message: msg.slice(0, 200) };
+  }
+}
+
+function maskKey(raw: string): string {
+  const t = raw.trim();
+  if (t.startsWith("!") || t.startsWith("$")) return t;
+  if (t.length <= 8) return "••••";
+  return `${t.slice(0, 3)}…${t.slice(-4)}`;
+}
+
+/**
+ * Save (or replace) one provider in ~/.kern/models.json. Creates ~/.kern
+ * (0700); uses 0600 file mode when a literal secret is stored. Masks keys
+ * in the returned summary — never log raw secrets.
+ */
+export async function saveProviderToUserFile(
+  name: string,
+  cfg: ProviderConfig,
+  makeDefault = false,
+): Promise<{ path: string; summary: string }> {
+  if (!/^[a-z0-9-]{1,32}$/.test(name)) {
+    throw new KernError("E_MODEL_REQUEST", `Bad provider name ${JSON.stringify(name)} — use [a-z0-9-].`);
+  }
+  if (!/^https?:\/\//i.test(cfg.baseUrl.trim())) {
+    throw new KernError("E_MODEL_REQUEST", `Bad baseUrl ${JSON.stringify(cfg.baseUrl)}.`);
+  }
+  const path = userModelsFile();
+  const { mkdir, writeFile, chmod } = await import("node:fs/promises");
+  await mkdir(join(homedir(), ".kern"), { recursive: true, mode: 0o700 });
+  let file: ModelsFile = {};
+  try {
+    file = JSON.parse(await readFile(path, "utf8")) as ModelsFile;
+  } catch {
+    file = {};
+  }
+  file.providers = { ...(file.providers ?? {}), [name]: cfg };
+  if (makeDefault) {
+    file.defaultProvider = name;
+    const first = cfg.models?.[0]?.id;
+    if (first) file.defaultModel = first;
+  }
+  const hasLiteralSecret = !!cfg.apiKey && !cfg.apiKey.trim().startsWith("!") && !cfg.apiKey.trim().startsWith("$");
+  await writeFile(path, JSON.stringify(file, null, 2) + "\n", { mode: hasLiteralSecret ? 0o600 : 0o644 });
+  try {
+    await chmod(path, hasLiteralSecret ? 0o600 : 0o644);
+  } catch {
+    // best effort (non-POSIX fs)
+  }
+  const keyNote = cfg.apiKey ? `key ${maskKey(cfg.apiKey)}` : cfg.apiKeyEnv ? `env ${cfg.apiKeyEnv}` : "no key";
+  return { path, summary: `${name} → ${cfg.baseUrl} (${keyNote})` };
+}
+
 const WELL_KNOWN: Record<string, { baseUrl: string; apiKeyEnv: string }> = {
   openai: { baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" },
   openrouter: { baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY" },
   ollama: { baseUrl: "http://localhost:11434/v1", apiKeyEnv: "" },
   lmstudio: { baseUrl: "http://localhost:1234/v1", apiKeyEnv: "" },
+  nvidia: { baseUrl: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY" },
 };
 
 export function modelsFilePaths(cwd: string): string[] {

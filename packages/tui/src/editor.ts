@@ -50,6 +50,8 @@ const PASTE_MARKER_RE = /^\[paste #(\d+) \+(\d+) lines\]$/;
 export class Editor implements Component, Focusable {
   focused = false;
   onSubmit: ((text: string) => void) | null = null;
+  /** Fired on Esc with an empty buffer (dismiss dialogs). */
+  onEscape: (() => void) | null = null;
   onChange: ((text: string) => void) | null = null;
   disableSubmit = false;
 
@@ -137,6 +139,8 @@ export class Editor implements Component, Focusable {
       if (this.buffer.length > 0) {
         this.buffer = "";
         this.cursor = 0;
+      } else {
+        this.onEscape?.();
       }
       return true;
     }
