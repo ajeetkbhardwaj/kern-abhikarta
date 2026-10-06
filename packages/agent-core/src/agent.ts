@@ -6,6 +6,7 @@ import { withRetry, DEFAULT_RETRY_CONFIG, type RetryConfig } from "./retry.js";
 import type {
   Logger,
   ModelAdapter,
+  ModelInfo,
   ChatMessage,
   ToolResultBlock,
   ToolCallBlock,
@@ -42,7 +43,7 @@ export interface RunTurnOptions {
 }
 
 export class AgentRuntime {
-  private readonly model: ModelAdapter;
+  private model: ModelAdapter;
   private readonly tools: ToolRegistry;
   private readonly sessions: SessionManager;
   private readonly contextBuilder: ContextBuilder;
@@ -52,6 +53,7 @@ export class AgentRuntime {
   private readonly compactor: Compactor | null;
   private readonly retry: RetryConfig;
   private readonly requestApproval?: (prompt: string) => Promise<boolean>;
+  private busy = false;
   private turn = 0;
 
   constructor(options: AgentRuntimeOptions) {
@@ -71,9 +73,27 @@ export class AgentRuntime {
     return this.budgets.usage();
   }
 
+  isBusy(): boolean {
+    return this.busy;
+  }
+
+  modelInfo(): ModelInfo {
+    return this.model.info;
+  }
+
+  /** Switch adapter mid-session. Records a model_change entry. Fails while busy. */
+  async setModel(adapter: ModelAdapter): Promise<void> {
+    if (this.busy) throw new Error("Cannot switch model while a turn is running");
+    this.model = adapter;
+    await this.sessions.appendModelChange(adapter.info.provider, adapter.info.modelId);
+    this.logger.info("model_changed", { provider: adapter.info.provider, model: adapter.info.modelId });
+  }
+
   async runUserTurn(userText: string, opts: RunTurnOptions = {}): Promise<void> {
+    if (this.busy) throw new Error("A turn is already running; wait for agent_settled");
     const signal = opts.signal;
     this.throwIfAborted(signal);
+    this.busy = true;
     this.events.emit({ type: "agent_start" });
     this.turn = 0;
     try {
@@ -135,6 +155,8 @@ export class AgentRuntime {
       this.events.emit({ type: "agent_error", error: serialized });
       this.events.emit({ type: "agent_settled" });
       throw error;
+    } finally {
+      this.busy = false;
     }
   }
 

@@ -12,6 +12,9 @@ interface CliFlags {
   noCompaction: boolean;
   resume: boolean;
   listModels: boolean;
+  interactive: boolean;
+  print: boolean;
+  hadPrompt?: boolean;
   provider?: string;
   model?: string;
   baseUrl?: string;
@@ -19,7 +22,7 @@ interface CliFlags {
 }
 
 function parseArgs(argv: string[]): CliFlags {
-  const flags: CliFlags = { prompt: "", readOnly: false, cwd: process.cwd(), noResources: false, noCompaction: false, resume: false, listModels: false };
+  const flags: CliFlags = { prompt: "", readOnly: false, cwd: process.cwd(), noResources: false, noCompaction: false, resume: false, listModels: false, interactive: false, print: false };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -27,6 +30,8 @@ function parseArgs(argv: string[]): CliFlags {
     else if (arg === "--no-resources") flags.noResources = true;
     else if (arg === "--no-compaction") flags.noCompaction = true;
     else if (arg === "--resume") flags.resume = true;
+    else if (arg === "--interactive" || arg === "-i") flags.interactive = true;
+    else if (arg === "--print") flags.print = true;
     else if (arg === "--list-models") flags.listModels = true;
     else if (arg === "--provider") {
       const next = argv[++i];
@@ -62,13 +67,14 @@ function parseArgs(argv: string[]): CliFlags {
       positional.push(arg);
     }
   }
-  flags.prompt = positional.join(" ") || "What is in README.md?";
+  flags.prompt = positional.join(" ");
+  flags.hadPrompt = positional.length > 0;
   return flags;
 }
 
 function printHelp(): void {
   process.stdout.write(
-    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] "<prompt>"\n\nFlags:\n  --read-only       Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N     Cap agent turns for this run\n  --cwd DIR         Workspace root (default: cwd)\n  --no-resources    Skip AGENTS.md / skill discovery\n  --no-compaction   Disable automatic compaction\n  --resume          Resume the most recent session\n  --list-models     List available models (configured + live) and exit\n  --provider NAME   Provider from models.json (or KERN_PROVIDER)\n  --model ID        Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL    Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY     Override API key (or KERN_API_KEY)\n  --help, -h        This message\n`,
+    `kern — minimal coding agent kernel\n\nUsage:\n  kern [flags] "<prompt>"\n\nFlags:\n  --read-only       Only read/grep/find/ls-class tools (here: read only)\n  --max-turns N     Cap agent turns for this run\n  --cwd DIR         Workspace root (default: cwd)\n  --no-resources    Skip AGENTS.md / skill discovery\n  --no-compaction   Disable automatic compaction\n  --resume          Resume the most recent session\n  --interactive, -i  Interactive TUI (default when TTY and no prompt given)\n  --print           Force single-prompt print mode\n  --list-models     List available models (configured + live) and exit\n  --provider NAME   Provider from models.json (or KERN_PROVIDER)\n  --model ID        Model id, optionally provider/id (or KERN_MODEL)\n  --base-url URL    Override endpoint base URL (or KERN_BASE_URL)\n  --api-key KEY     Override API key (or KERN_API_KEY)\n  --help, -h        This message\n`,
   );
 }
 
@@ -92,6 +98,7 @@ async function main() {
   const baseUrl = flags.baseUrl ?? process.env["KERN_BASE_URL"];
   const apiKey = flags.apiKey ?? process.env["KERN_API_KEY"];
   const file = await loadModelsFile(flags.cwd);
+  const approvalHook: { current: ((prompt: string) => Promise<boolean>) | null } = { current: null };
 
   if (flags.listModels) {
     const models = await discoverModels(file, { provider, baseUrl, apiKey });
@@ -136,9 +143,28 @@ async function main() {
     resume: flags.resume,
     policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
     budgets: flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : undefined,
-    requestApproval: askApproval,
+    requestApproval: (prompt) => (approvalHook.current ? approvalHook.current(prompt) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
   });
+
+  const wantInteractive =
+    flags.interactive || (!flags.print && !flags.hadPrompt && process.stdin.isTTY && process.stdout.isTTY);
+  if (wantInteractive) {
+    const { runInteractive } = await import("@kern/tui");
+    await runInteractive({
+      session,
+      modelsFile: file,
+      providerName: providerName,
+      baseUrl,
+      apiKey,
+      cwd: flags.cwd,
+      logger,
+      approvalHook,
+    });
+    return;
+  }
+
+  const prompt = flags.prompt || "What is in README.md?";
   session.subscribe((ev) => {
     switch (ev.type) {
       case "text_delta":
@@ -167,7 +193,7 @@ async function main() {
         break;
     }
   });
-  await session.prompt(flags.prompt);
+  await session.prompt(prompt);
 }
 
 main().catch((err) => {

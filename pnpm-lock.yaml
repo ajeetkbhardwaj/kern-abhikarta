@@ -148,6 +148,9 @@ importers:
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@kern/tui':
+        specifier: workspace:*
+        version: link:../tui
 
   packages/coding-agent:
     dependencies:
@@ -193,6 +196,18 @@ importers:
       zod:
         specifier: ^3.24.1
         version: 3.25.76
+
+  packages/tui:
+    dependencies:
+      '@kern/coding-agent':
+        specifier: workspace:*
+        version: link:../coding-agent
+      '@kern/model':
+        specifier: workspace:*
+        version: link:../model
+      '@kern/protocol':
+        specifier: workspace:*
+        version: link:../protocol
 
 packages:
 

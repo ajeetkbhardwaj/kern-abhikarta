@@ -170,6 +170,20 @@ export class SessionManager {
     return this.appendAssistantMessage(msg);
   }
 
+  async appendModelChange(provider: string, model: string, thinkingLevel?: string): Promise<ModelChangeEntry> {
+    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+    const parentId = this.state.activeLeafId;
+    const entry: ModelChangeEntry = { id: newId("v"), parentId, timestamp: now(), type: "model_change", provider, model, seq: this.nextSeq() };
+    if (thinkingLevel !== undefined) entry.thinkingLevel = thinkingLevel;
+    await this.store.append(this.filePath, entry);
+    this.state.entries.set(entry.id, entry);
+    const arr = this.state.children.get(parentId) ?? [];
+    arr.push(entry.id);
+    this.state.children.set(parentId, arr);
+    this.state.activeLeafId = entry.id;
+    return entry;
+  }
+
   async appendCompaction(summary: string, replacesThroughId: string): Promise<CompactionEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;

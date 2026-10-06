@@ -10,7 +10,7 @@ import {
   DEFAULT_POLICY_CONFIG,
   type PolicyConfig,
 } from "@kern/tools";
-import { createLogger, type Logger, type ModelAdapter, type AgentEventListener } from "@kern/protocol";
+import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener } from "@kern/protocol";
 import type { BudgetLimits } from "@kern/agent-core";
 
 export interface CreateAgentSessionOptions {
@@ -37,6 +37,9 @@ export interface AgentSession {
   prompt(text: string, opts?: { signal?: AbortSignal }): Promise<void>;
   subscribe(listener: AgentEventListener): () => void;
   budgetUsage(): { turns: number; totalToolCalls: number; wallTimeMs: number };
+  isBusy(): boolean;
+  setModel(adapter: ModelAdapter): Promise<void>;
+  modelInfo(): ModelInfo;
 }
 
 export async function createAgentSession(
@@ -95,6 +98,9 @@ export async function createAgentSession(
     prompt: (text, opts) => runtime.runUserTurn(text, opts ?? {}),
     subscribe: (l) => events.subscribe(l),
     budgetUsage: () => runtime.budgetUsage(),
+    isBusy: () => runtime.isBusy(),
+    setModel: (adapter) => runtime.setModel(adapter),
+    modelInfo: () => runtime.modelInfo(),
   };
   return { session, manager };
 }

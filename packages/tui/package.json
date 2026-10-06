@@ -1,9 +1,9 @@
 {
-  "name": "@kern/cli",
+  "name": "@kern/tui",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Command-line entry point and argument parsing.",
+  "description": "Interactive terminal UI for Kern (regular scrollback mode).",
   "exports": {
     ".": "./src/index.ts"
   },
@@ -11,7 +11,6 @@
   "dependencies": {
     "@kern/protocol": "workspace:*",
     "@kern/coding-agent": "workspace:*",
-    "@kern/model": "workspace:*",
-    "@kern/tui": "workspace:*"
+    "@kern/model": "workspace:*"
   }
 }
