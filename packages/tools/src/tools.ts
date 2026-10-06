@@ -330,8 +330,10 @@ export function createEditTool(
           count = 1;
         }
         await writeFile(target, next, "utf8");
+        const diff = unifiedHunk(text, next, 3);
+        const summary = `Replaced ${count} occurrence(s) in ${args.path}`;
         return {
-          content: [{ type: "text", text: `Replaced ${count} occurrence(s) in ${args.path}` }],
+          content: [{ type: "text", text: diff ? `${summary}\n${diff}` : summary }],
           isError: false,
           details: { changedPaths: [args.path], replacements: count },
         };
@@ -357,6 +359,29 @@ function killTree(proc: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void 
       // already dead
     }
   }
+}
+
+/** Minimal unified hunk around the first changed region (for display). */
+function unifiedHunk(before: string, after: string, context: number): string {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length - 1;
+  let endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA--;
+    endB--;
+  }
+  const out: string[] = [];
+  for (let i = Math.max(0, start - context); i < start; i++) out.push(`  ${a[i]}`);
+  for (let i = start; i <= endA; i++) out.push(`- ${a[i]}`);
+  for (let i = start; i <= endB; i++) out.push(`+ ${b[i]}`);
+  for (let i = endA + 1; i <= Math.min(a.length - 1, Math.max(endA, endB) + context); i++) {
+    if (i >= 0 && i < a.length) out.push(`  ${a[i]}`);
+  }
+  const MAX = 40;
+  return out.slice(0, MAX).join("\n") + (out.length > MAX ? `\n… ${out.length - MAX} more diff lines` : "");
 }
 
 export function createBashTool(root: string, timeoutMs = 120000): ToolDefinition<{ command: string; timeoutMs?: number }> {

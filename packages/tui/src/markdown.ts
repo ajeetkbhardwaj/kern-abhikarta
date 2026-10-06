@@ -100,10 +100,11 @@ function renderMarkdown(text: string, t: MarkdownTheme, width: number): string[]
   let fenceBuffer: string[] = [];
   let fenceLang = "";
   const flushFence = () => {
-    rows.push(t.codeBlockBorder("```" + fenceLang));
+    const label = fenceLang ? ` ${fenceLang} ` : "";
+    rows.push(t.codeBlockBorder("╭─" + label + "─".repeat(Math.max(0, Math.min(width, 60) - label.length - 3))));
     const highlighted = t.highlightCode ? t.highlightCode(fenceBuffer.join("\n"), fenceLang || undefined) : fenceBuffer;
-    for (const line of highlighted) rows.push(...wrapTextWithAnsi("  " + line, width));
-    rows.push(t.codeBlockBorder("```"));
+    for (const line of highlighted) rows.push(...wrapTextWithAnsi("│ " + line, width));
+    rows.push(t.codeBlockBorder("╰" + "─".repeat(Math.max(0, Math.min(width, 60) - 1))));
     fenceBuffer = [];
   };
   for (const line of lines) {
@@ -144,9 +145,10 @@ function renderMarkdown(text: string, t: MarkdownTheme, width: number): string[]
   }
   if (inFence) {
     // Unclosed fence (still streaming): render contents as code so far.
-    rows.push(t.codeBlockBorder("```" + fenceLang));
+    const label = fenceLang ? ` ${fenceLang} ` : "";
+    rows.push(t.codeBlockBorder("╭─" + label + "─".repeat(Math.max(0, Math.min(width, 60) - label.length - 3))));
     const highlighted = t.highlightCode ? t.highlightCode(fenceBuffer.join("\n"), fenceLang || undefined) : fenceBuffer;
-    for (const hl of highlighted) rows.push(...wrapTextWithAnsi("  " + hl, width));
+    for (const hl of highlighted) rows.push(...wrapTextWithAnsi("│ " + hl, width));
   }
   return rows;
 }

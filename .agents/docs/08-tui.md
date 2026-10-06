@@ -1,5 +1,10 @@
 # 08 — TUI (`@kern/tui`)
 
+Scrollback-mode terminal UI on our own zero-dependency component framework:
+differential main-screen renderer, synchronized output (CSI 2026),
+multiline editor, Markdown with syntax highlighting, searchable select
+lists, loader, boxes, status bar, tool cards.
+
 Scrollback-mode terminal UI: transcript streams into native scrollback, a
 raw-mode multiline editor owns the bottom block while idle. Zero
 dependencies. The TUI observes `AgentEvent`s and acts only through the
@@ -61,3 +66,15 @@ fences, quotes, lists); only fence state crosses lines. Tool cards
 `/help /model /compact [note] /diff /new /export [file] /budget /clear
 /quit`. `/new` swaps in a fresh session (resubscribed, file cache
 refreshed); `/export` dumps the active path to markdown.
+
+## Visual structure
+
+- Header banner in a titled box (product, model, mode, cwd), divider rule.
+- Prompt editor inside a `prompt` box; cursor positioned via marker scan.
+- Full-width status bar (model │ mode │ ctx% │ turns/calls/time).
+- Tool executions render as live cards: header with arg summary, streamed
+  output (capped, "+N more"), ✔/✖ footer with duration. Edit results show
+  a unified diff hunk.
+- Code fences render as bordered blocks with language label.
+- Approval / model / history dialogs are titled boxes; dialogs route input
+  to the interactive child via `Box.setInputTarget`.

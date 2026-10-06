@@ -16,7 +16,7 @@ import type { SessionManager } from "@kern/session-store";
 import { createAdapterFor, discoverModels, type ModelsFile } from "@kern/model";
 import { theme } from "./theme.js";
 import { Screen } from "./screen.js";
-import { Container, Text, Spacer } from "./components.js";
+import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./components.js";
 import { Editor, defaultEditorTheme } from "./editor.js";
 import { SelectList, Loader, defaultSelectListTheme } from "./select-list.js";
 import { Markdown, defaultMarkdownTheme } from "./markdown.js";
@@ -66,15 +66,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const screen = new Screen();
   const transcript = new Container();
-  const status = new Text("", 0, 0);
+  const statusBar = new StatusBar();
   const editor = new Editor("› ");
+  const editorBox = new Box(editor, { title: "prompt" });
   const autocomplete = new KernAutocomplete(COMMANDS, cwd);
   editor.setAutocompleteProvider(autocomplete);
   await autocomplete.refreshFiles();
 
   screen.addChild(transcript);
-  screen.addChild(status);
-  screen.addChild(editor);
+  screen.addChild(statusBar);
+  screen.addChild(editorBox);
   screen.setFocus(editor);
 
   let busy = false;
@@ -114,23 +115,35 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const printHeader = () => {
     const m = session.modelInfo();
-    say(theme.bold("kern") + theme.muted(`  ${m.provider}/${m.modelId}  ·  ${modeLabel()}  ·  ${cwd}`));
+    const head = new Box(
+      new Text(`${theme.bold("kern")}  ${m.provider}/${m.modelId}  ·  ${modeLabel()}  ·  ${cwd}`, 1, 0),
+      { title: "kern" },
+    );
+    transcript.addChild(head);
     info("Type a task, or /help for commands.");
     info(HINTS);
+    transcript.addChild(new Rule());
+    screen.requestRender();
   };
 
   const printStatus = () => {
     const u = session.budgetUsage();
     const m = session.modelInfo();
     const usage = session.contextUsage();
-    const ctx = usage ? ` · ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "";
-    status.setText(theme.muted(`— ${m.provider}/${m.modelId} · ${modeLabel()} · ${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s${ctx}`));
+    const ctx = usage ? `ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "ctx —";
+    statusBar.setSegments([
+      `${m.provider}/${m.modelId}`,
+      modeLabel(),
+      ctx,
+      `${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s`,
+    ]);
     screen.requestRender();
   };
 
   // --- event → transcript -----------------------------------------------------
   let md: Markdown | null = null;
   let mdText = "";
+  const cards = new Map<string, ToolCard>();
   const closeAssistant = () => {
     md = null;
     mdText = "";
@@ -161,19 +174,44 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           transcript.addChild(new Spacer(1));
           screen.requestRender();
           break;
-        case "tool_execution_start":
+        case "tool_execution_start": {
           closeAssistant();
           activity = `running ${event.toolName}`;
           if (loader) loader.setMessage(activity);
-          say(theme.tool(`◈ ${event.toolName}`));
+          const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
+          cards.set(event.toolCallId, card);
+          transcript.addChild(new Box(card, {}));
+          screen.requestRender();
           break;
-        case "tool_execution_end":
-          say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
+        }
+        case "tool_execution_end": {
+          const card = cards.get(event.toolCallId);
+          cards.delete(event.toolCallId);
+          const output = event.result
+            ? event.result.content.map((c) => c.text).join("\n")
+            : "";
+          const detail = event.result?.details;
+          const extra =
+            detail && typeof detail === "object" && "durationMs" in detail
+              ? `${((detail.durationMs as number) / 1000).toFixed(1)}s`
+              : "";
+          if (card) {
+            if (output) card.appendOutput(output);
+            card.finish(event.isError, extra);
+          } else {
+            say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
+          }
+          screen.requestRender();
           break;
-        case "tool_execution_update":
+        }
+        case "tool_execution_update": {
           activity = `running ${event.toolName}`;
           if (loader) loader.setMessage(activity);
+          const card = cards.get(event.toolCallId);
+          if (card && typeof event.delta === "string") card.appendOutput(event.delta);
+          screen.requestRender();
           break;
+        }
         case "auto_compaction_start":
           activity = "compacting context";
           if (loader) loader.setMessage(activity);
@@ -208,16 +246,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   ): Promise<boolean | "session"> => {
     const tool = meta?.toolName ?? "tool";
     const picked = await new Promise<string | null>((resolve) => {
+      const body = new Container();
+      body.addChild(new Text(theme.warn(prompt), 0, 0));
       const list = new SelectList<string>(
-        `Approval: ${tool} — ${prompt}`,
+        "",
         [
-          { value: "once", label: "Yes, run once" },
-          { value: "session", label: `Yes, always allow ${tool} this session` },
-          { value: "no", label: "No" },
+          { value: "once", label: "Yes, run once", description: "allow just this call" },
+          { value: "session", label: `Yes, always allow ${tool}`, description: "no more prompts this session" },
+          { value: "no", label: "No", description: "deny (Esc)" },
         ],
         5,
         defaultSelectListTheme,
       );
+      body.addChild(list);
+      const box = new Box(body, { title: `approval: ${tool}` });
+      box.setInputTarget(list);
       list.onSelect = (item) => {
         screen.hideOverlay();
         screen.setFocus(editor);
@@ -228,7 +271,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         screen.setFocus(editor);
         resolve(null);
       };
-      screen.showOverlay(list);
+      screen.showOverlay(box);
     });
     if (picked === "session") {
       ok(`Always allowing ${tool} for this session.`);
@@ -297,7 +340,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- overlays: model picker, history -------------------------------------------------
-  const withOverlay = async (list: SelectList<string>, onPick: (value: string) => Promise<void> | void): Promise<void> => {
+  const withOverlay = async (
+    title: string,
+    list: SelectList<string>,
+    onPick: (value: string) => Promise<void> | void,
+  ): Promise<void> => {
+    const box = new Box(list, { title });
+    box.setInputTarget(list);
     await new Promise<void>((resolve) => {
       list.onSelect = (item) => {
         screen.hideOverlay();
@@ -309,7 +358,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         screen.setFocus(editor);
         resolve();
       };
-      screen.showOverlay(list);
+      screen.showOverlay(box);
     });
   };
 
@@ -347,7 +396,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       defaultSelectListTheme,
     );
     if (initialFilter) list.setFilter(initialFilter);
-    await withOverlay(list, async (value) => {
+    await withOverlay("model", list, async (value) => {
       const slash = value.indexOf("/");
       const provider = value.slice(0, slash);
       const id = value.slice(slash + 1);
@@ -379,7 +428,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       10,
       defaultSelectListTheme,
     );
-    await withOverlay(list, (value) => editor.setText(value));
+    await withOverlay("history", list, (value) => editor.setText(value));
   };
 
   const cycleMode = () => {
@@ -487,6 +536,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- prompt submission ---------------------------------------------------------------------
+  /** One-line arg summary for tool cards (path/command first, capped). */
+  const summarizeArgs = (args: unknown): string => {
+    if (typeof args !== "object" || args === null) return "";
+    const record = args as Record<string, unknown>;
+    const first =
+      typeof record["path"] === "string"
+        ? record["path"]
+        : typeof record["command"] === "string"
+          ? record["command"]
+          : Object.entries(record)
+              .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+              .join(" ");
+    const text = String(first);
+    return text.length > 100 ? text.slice(0, 100) + "…" : text;
+  };
+
   const runTurn = (text: string) => {
     busy = true;
     abort = new AbortController();
