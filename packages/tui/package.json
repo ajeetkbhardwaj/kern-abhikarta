@@ -9,9 +9,10 @@
   },
   "types": "./src/index.ts",
   "dependencies": {
-    "@kern/protocol": "workspace:*",
+    "@earendil-works/pi-tui": "1.0.4",
     "@kern/coding-agent": "workspace:*",
     "@kern/model": "workspace:*",
+    "@kern/protocol": "workspace:*",
     "@kern/session-store": "workspace:*"
   }
 }

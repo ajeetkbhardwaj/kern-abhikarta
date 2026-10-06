@@ -1,27 +1,35 @@
 /**
- * @kern/tui — interactive orchestrator (regular scrollback mode).
+ * @kern/tui — interactive orchestrator on the pi-tui framework.
  *
- * Transcript streams into terminal scrollback as events arrive; a raw-mode
- * multiline editor owns the bottom block while idle. While a turn runs the
- * editor suspends, a spinner shows elapsed time + activity, and typed input
- * queues for the next turn (Ctrl+C/Esc aborts instead). Approvals are
- * arrow-key dialogs (Esc declines); the /model picker, history search, and
- * mode cycling all ride the same overlay/key plumbing. The TUI only observes
- * `AgentEvent`s — it never mutates kernel state except through `AgentSession`.
+ * Main-screen renderer (native scrollback), transcript Container, Markdown
+ * streaming with syntax highlighting, Editor with slash/file completion,
+ * SelectList overlays for approvals / model picker / history, Loader
+ * spinner while busy. The TUI observes `AgentEvent`s and acts only through
+ * the `AgentSession` API — all kernel guarantees hold unchanged.
  */
 
-import { writeFile, readFile, readdir, stat } from "node:fs/promises";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { writeFile, readFile, stat } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import {
+  ProcessTerminal,
+  TuiMainScreen,
+  Container,
+  Text,
+  Editor,
+  Markdown,
+  SelectList,
+  CombinedAutocompleteProvider,
+  Spacer,
+  Loader,
+  matchesKey,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
 import { createAdapterFor, discoverModels, type ModelsFile } from "@kern/model";
-import { theme, CLEAR_LINE, CLEAR_SCREEN, SHOW_CURSOR } from "./theme.js";
-import { LineEditor } from "./input.js";
-import { SelectOverlay } from "./select.js";
-import { MarkdownStream } from "./markdown.js";
-import { truncateToWidth, splitKeys } from "./text.js";
+import { theme } from "./theme.js";
 
 export interface InteractiveOptions {
   session: AgentSession;
@@ -38,25 +46,72 @@ export interface InteractiveOptions {
   approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session">) | null };
 }
 
-const COMMANDS: Array<{ name: string; hint: string }> = [
-  { name: "/help", hint: "show this list" },
-  { name: "/model", hint: "pick provider/model (auto-listed)" },
-  { name: "/compact [note]", hint: "summarize history into a checkpoint" },
-  { name: "/diff", hint: "show working-tree changes" },
-  { name: "/new", hint: "start a fresh session" },
-  { name: "/export [file]", hint: "dump transcript to markdown" },
-  { name: "/budget", hint: "show turn/call/time usage" },
-  { name: "/clear", hint: "clear the screen" },
-  { name: "/quit", hint: "exit (also Ctrl+D twice, or Ctrl+C on empty input)" },
+const COMMANDS: Array<{ name: string; description: string }> = [
+  { name: "help", description: "show this list" },
+  { name: "model", description: "pick provider/model (auto-listed)" },
+  { name: "compact", description: "summarize history into a checkpoint" },
+  { name: "diff", description: "show working-tree changes" },
+  { name: "new", description: "start a fresh session" },
+  { name: "export", description: "dump transcript to markdown" },
+  { name: "budget", description: "show turn/call/time usage" },
+  { name: "clear", description: "clear the screen" },
+  { name: "quit", description: "exit the session" },
 ];
 
-const HINTS = "Enter send · Alt+Enter/Ctrl+J newline · Tab complete · @ files · ! shell · Ctrl+C abort · Esc clear";
-
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const ENABLE_PASTE = "\u001b[?2004h";
-const DISABLE_PASTE = "\u001b[?2004l";
-const INVISIBLE_RE = /[\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u{E0000}-\u{E007F}]/gu;
+const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · Ctrl+C abort";
 const MAX_QUEUE = 5;
+// Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
+const INVISIBLE_RE = /[‌‎‏‪-‮⁠-⁤﻿]/gu;
+
+const editorTheme = {
+  borderColor: theme.muted,
+  selectList: {
+    selectedPrefix: theme.accent,
+    selectedText: theme.bold,
+    description: theme.muted,
+    scrollInfo: theme.muted,
+    noMatch: theme.muted,
+  },
+};
+
+const mdTheme = {
+  heading: (s: string) => theme.accent(theme.bold(s)),
+  link: (s: string) => `\u001b[4;36m${s}\u001b[0m`,
+  linkUrl: theme.muted,
+  code: theme.tool,
+  codeBlock: (s: string) => s,
+  codeBlockBorder: theme.muted,
+  quote: theme.muted,
+  quoteBorder: theme.muted,
+  hr: theme.muted,
+  listBullet: theme.accent,
+  bold: theme.bold,
+  italic: (s: string) => `\u001b[3m${s}\u001b[0m`,
+  strikethrough: (s: string) => `\u001b[9m${s}\u001b[0m`,
+  underline: (s: string) => `\u001b[4m${s}\u001b[0m`,
+  highlightCode,
+};
+
+/** Minimal keyword/string/comment/number highlighter for fenced code. */
+function highlightCode(code: string): string[] {
+  const keywords =
+    /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|class|extends|import|from|export|default|async|await|try|catch|finally|throw|typeof|interface|type|enum|def|elif|fn|struct|impl|match|use|pub|echo|then|fi|do|done|null|true|false|None|True|False)\b/g;
+  return code.split("\n").map((line) => {
+    const comment = line.match(/(\/\/|#|--).*$/);
+    let body = line;
+    let tail = "";
+    if (comment && !/^(\s* погрешность)/.test(line)) {
+      const idx = comment.index ?? line.length;
+      tail = theme.muted(line.slice(idx));
+      body = line.slice(0, idx);
+    }
+    body = body
+      .replace(/("[^"]*"|'[^']*'|`[^`]*`)/g, (m) => theme.tool(m))
+      .replace(keywords, (m) => theme.accent(m))
+      .replace(/\b(\d[\d._]*)\b/g, (m) => `\u001b[33m${m}\u001b[0m`);
+    return body + tail;
+  });
+}
 
 export async function runInteractive(options: InteractiveOptions): Promise<void> {
   const logger = options.logger ?? nullLogger;
@@ -67,137 +122,58 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   }
   const cwd = resolve(options.cwd);
 
-  // --- workspace file cache for @ mentions ----------------------------------
-  let fileCache: string[] = [];
-  let fileCacheAt = 0;
-  const refreshFiles = async (): Promise<void> => {
-    try {
-      fileCache = await listWorkspaceFiles(cwd);
-      fileCacheAt = Date.now();
-    } catch {
-      // keep the old cache
-    }
-  };
-  await refreshFiles();
+  const terminal = new ProcessTerminal();
+  const tui: TUI = new TuiMainScreen(terminal);
+  const transcript = new Container();
+  const status = new Text("", 0, 0);
+  const editor = new Editor(tui, editorTheme);
+  editor.setAutocompleteProvider(new CombinedAutocompleteProvider(COMMANDS, cwd));
 
-  /** Ghost remainder shown dim after the cursor (top match, not yet accepted). */
-  const ghostFor = (beforeCursor: string): string => {
-    const slash = beforeCursor.match(/(^|\s)(\/[A-Za-z-]*)$/);
-    if (slash) {
-      const prefix = slash[2] ?? "";
-      const matches = COMMANDS.map((c) => c.name).filter((n) => n.startsWith(prefix) && n !== prefix);
-      if (matches.length > 0) {
-        const extra = matches.length > 1 ? `  (+${matches.length - 1})` : "";
-        return (matches[0] ?? "").slice(prefix.length) + extra;
-      }
-      return "";
-    }
-    const mention = beforeCursor.match(/(^|\s)@([^\s]*)$/);
-    if (mention) {
-      const prefix = (mention[2] ?? "").toLowerCase();
-      const matches = fileCache.filter((f) => f.toLowerCase().startsWith(prefix)).slice(0, 4);
-      if (matches.length > 0) return (matches[0] ?? "").slice(prefix.length);
-    }
-    return "";
-  };
+  tui.addChild(transcript);
+  tui.addChild(status);
+  tui.addChild(editor);
+  tui.setFocus(editor);
 
-  const editor = new LineEditor({
-    prompt: "› ",
-    completer: (before) => {
-      const g = ghostFor(before);
-      if (!g) return null;
-      // Accept path: Tab handler asks complete() for the insert text.
-      const slash = before.match(/(^|\s)(\/[A-Za-z-]*)$/);
-      if (slash) {
-        const prefix = slash[2] ?? "";
-        const match = COMMANDS.map((c) => c.name).find((n) => n.startsWith(prefix) && n !== prefix);
-        if (match) return { insert: match.slice(prefix.length) + " ", ghost: g };
-      }
-      const mention = before.match(/(^|\s)@([^\s]*)$/);
-      if (mention) {
-        const prefix = (mention[2] ?? "").toLowerCase();
-        const match = fileCache.find((f) => f.toLowerCase().startsWith(prefix));
-        if (match) {
-          const rest = match.slice(prefix.length);
-          return { insert: (rest.length > 0 ? rest : "") + " ", ghost: g };
-        }
-      }
-      return null;
-    },
-  });
-  const md = new MarkdownStream();
   let busy = false;
   let abort: AbortController | null = null;
-  let overlayOpen = false;
-  let keyQueue: string[] = [];
-  let keyWaiters: Array<(k: string) => void> = [];
   let exiting = false;
   let unsubscribe: (() => void) | null = null;
   let activity = "thinking";
-  let turnStartedAt = 0;
+  let loader: Loader | null = null;
+  let loaderMsg = "thinking";
   let queue: string[] = [];
   let lastExitAttempt = 0;
+  let stash = "";
+  const recentPrompts: string[] = [];
 
-  const readKey = (): Promise<string> => {
-    const next = keyQueue.shift();
-    if (next !== undefined) return Promise.resolve(next);
-    return new Promise((resolve) => keyWaiters.push(resolve));
+  const say = (text: string) => {
+    transcript.addChild(new Text(text, 0, 0));
+    tui.requestRender();
   };
+  const info = (text: string) => say(theme.muted(text));
+  const err = (text: string) => say(theme.error(text));
+  const ok = (text: string) => say(theme.success(text));
 
-  // --- status row + spinner-aware output -------------------------------------------
-  // While busy, the last screen row is always exactly one status row
-  // (spinner or queue-draft echo), cursor on it, no trailing newline.
-  let spinnerVisible = false;
-  let spinnerFrame = 0;
-  let lastPrintAt = 0;
-  let queueDraft: string | null = null;
-  const hideSpinner = () => {
-    if (spinnerVisible) {
-      process.stdout.write(CLEAR_LINE);
-      spinnerVisible = false;
+  const setBusy = (running: boolean) => {
+    busy = running;
+    if (running) {
+      loaderMsg = activity;
+      loader = new Loader(tui, theme.accent, theme.muted, loaderMsg);
+      transcript.addChild(loader);
+      loader.start();
+    } else if (loader) {
+      loader.stop();
+      transcript.removeChild(loader);
+      loader = null;
     }
+    tui.requestRender();
   };
-  const renderQueueDraft = (): string => {
-    const shown = (queueDraft ?? "").replace(/\n/g, "⏎");
-    return `… queue: ${shown}`;
-  };
-  const drawStatus = () => {
-    if (exiting || !busy || overlayOpen) return;
-    const elapsed = ((Date.now() - turnStartedAt) / 1000).toFixed(0);
-    const frame = SPINNER[spinnerFrame++ % SPINNER.length];
-    const text = queueDraft !== null ? renderQueueDraft() : `${frame} ${elapsed}s · ${activity} (Ctrl+C/Esc abort, type to queue)`;
-    process.stdout.write(CLEAR_LINE + theme.muted(text));
-    spinnerVisible = true;
-  };
-  const print = (s: string) => {
-    hideSpinner();
-    process.stdout.write(s + "\n");
-    lastPrintAt = Date.now();
-    if (busy && !overlayOpen) drawStatus();
-  };
-  const printRaw = (s: string) => {
-    hideSpinner();
-    process.stdout.write(s);
-    lastPrintAt = Date.now();
-    if (busy && !overlayOpen) drawStatus();
-  };
-  const info = (s: string) => print(theme.muted(s));
 
-  const tick = () => {
-    if (exiting || !busy || overlayOpen) return;
-    if (Date.now() - lastPrintAt < 300) return;
-    drawStatus();
-  };
-  const spinner = setInterval(tick, 120);
-
-  const modeLabel = () => {
-    const mode = session.approvalMode();
-    return mode === "ask" ? "manual" : mode;
-  };
+  const modeLabel = () => (session.approvalMode() === "ask" ? "manual" : session.approvalMode());
 
   const printHeader = () => {
     const m = session.modelInfo();
-    print(theme.bold("kern") + theme.muted(`  ${m.provider}/${m.modelId}  ·  ${modeLabel()}  ·  ${cwd}`));
+    say(theme.bold("kern") + theme.muted(`  ${m.provider}/${m.modelId}  ·  ${modeLabel()}  ·  ${cwd}`));
     info("Type a task, or /help for commands.");
     info(HINTS);
   };
@@ -207,16 +183,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const m = session.modelInfo();
     const usage = session.contextUsage();
     const ctx = usage ? ` · ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "";
-    info(`— ${m.provider}/${m.modelId} · ${modeLabel()} · ${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s${ctx}`);
+    status.setText(theme.muted(`— ${m.provider}/${m.modelId} · ${modeLabel()} · ${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s${ctx}`));
+    tui.requestRender();
   };
 
   // --- event → transcript -----------------------------------------------------
-  let assistantOpen = false;
+  let md: Markdown | null = null;
+  let mdText = "";
   const closeAssistant = () => {
-    if (assistantOpen) {
-      printRaw(md.flush() + "\n");
-      assistantOpen = false;
-    }
+    md = null;
+    mdText = "";
   };
 
   const subscribe = () => {
@@ -225,33 +201,37 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (exiting) return;
       switch (event.type) {
         case "text_delta":
-          if (!assistantOpen) {
-            print(theme.bold("assistant"));
-            assistantOpen = true;
+          if (!md) {
+            say(theme.bold("assistant"));
+            mdText = "";
+            md = new Markdown("", 0, 0, mdTheme);
+            transcript.addChild(md);
           }
-          printRaw(md.push(event.delta));
+          mdText += event.delta;
+          md.setText(mdText);
+          tui.requestRender();
           break;
         case "reasoning_delta":
           activity = "thinking";
+          if (loader) loader.setMessage("thinking");
           break;
         case "message_end":
           closeAssistant();
-          md.reset();
+          transcript.addChild(new Spacer(1));
+          tui.requestRender();
           break;
         case "tool_execution_start":
           closeAssistant();
-          md.reset();
           activity = `running ${event.toolName}`;
-          print(theme.tool(`◈ ${event.toolName}`) + theme.muted(` ${truncateToWidth(JSON.stringify(event.arguments), 120)}`));
+          if (loader) loader.setMessage(activity);
+          say(theme.tool(`◈ ${event.toolName}`));
           break;
         case "tool_execution_end":
-          print(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
-          break;
-        case "tool_execution_update":
-          activity = `running ${event.toolName}`;
+          say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
           break;
         case "auto_compaction_start":
           activity = "compacting context";
+          if (loader) loader.setMessage(activity);
           info(`[compacting context (${event.phase})…]`);
           break;
         case "auto_compaction_end":
@@ -259,16 +239,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           break;
         case "auto_retry_start":
           activity = `retrying (${event.reason})`;
+          if (loader) loader.setMessage(activity);
           info(`[retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms]`);
           break;
         case "agent_error":
           closeAssistant();
-          md.reset();
-          print(theme.error(`[error ${event.error.code}] ${event.error.message}`));
+          err(`[error ${event.error.code}] ${event.error.message}`);
           break;
         case "agent_settled":
           closeAssistant();
-          md.reset();
           break;
         default:
           break;
@@ -277,40 +256,45 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
   subscribe();
 
-  // --- permission dialog (arrows + Esc; Esc declines) ---------------------------
+  // --- approval dialog ----------------------------------------------------------
   options.approvalHook.current = async (
     prompt: string,
     meta?: { toolName: string },
   ): Promise<boolean | "session"> => {
-    editor.suspend();
-    hideSpinner();
-    lastPrintAt = Date.now();
     const tool = meta?.toolName ?? "tool";
-    overlayOpen = true;
-    const overlay = new SelectOverlay<string>(
-      `${theme.warn("Approval:")} ${tool}`,
-      [
-        { label: "Yes, run once", value: "once" },
-        { label: `Yes, always allow ${tool} this session`, value: "session" },
-        { label: "No", hint: "Esc", value: "no" },
-      ],
-    );
-    print(theme.muted(prompt));
-    const picked = await overlay.run(readKey);
-    overlayOpen = false;
-    lastPrintAt = Date.now();
+    const picked = await new Promise<string | null>((resolve) => {
+      const list = new SelectList(
+        [
+          { value: "once", label: "Yes, run once" },
+          { value: "session", label: `Yes, always allow ${tool} this session` },
+          { value: "no", label: "No" },
+        ],
+        5,
+        editorTheme.selectList,
+      );
+      list.onSelect = (item) => {
+        tui.hideOverlay();
+        tui.setFocus(editor);
+        resolve(item.value);
+      };
+      list.onCancel = () => {
+        tui.hideOverlay();
+        tui.setFocus(editor);
+        resolve(null);
+      };
+      say(theme.warn(`Approval: ${tool} — ${prompt}`));
+      tui.showOverlay(list);
+    });
     if (picked === "session") {
-      print(theme.success(`Always allowing ${tool} for this session.`));
-      if (!busy) editor.resume();
+      ok(`Always allowing ${tool} for this session.`);
       return "session";
     }
-    const ok = picked === "once";
-    print(ok ? theme.success("approved") : theme.muted("denied"));
-    if (!busy) editor.resume();
-    return ok;
+    const approved = picked === "once";
+    say(approved ? theme.success("approved") : theme.muted("denied"));
+    return approved;
   };
 
-  // --- transcript export ---------------------------------------------------------
+  // --- transcript export ----------------------------------------------------------
   const exportTranscript = async (file?: string): Promise<void> => {
     const path = manager.getActivePath();
     const target = file ?? join(cwd, `kern-session-${manager.sessionId ?? "export"}.md`);
@@ -339,10 +323,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
     }
     await writeFile(target, lines.join("\n"), "utf8");
-    print(theme.success(`Exported to ${target}`));
+    ok(`Exported to ${target}`);
   };
 
-  // --- @mention expansion ----------------------------------------------------------
+  // --- @mention expansion -----------------------------------------------------------
   const expandMentions = async (text: string): Promise<{ text: string; missing: string[] }> => {
     const missing: string[] = [];
     const refs = [...new Set([...text.matchAll(/(^|\s)@([^\s]+)/g)].map((m) => m[2] ?? ""))].filter(Boolean);
@@ -356,11 +340,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           missing.push(ref);
           continue;
         }
-        if (st.size > 40_000) {
-          content = (await readFile(abs, "utf8")).slice(0, 40_000) + "\n[…truncated…]";
-        } else {
-          content = await readFile(abs, "utf8");
-        }
+        content = await readFile(abs, "utf8");
+        if (content.length > 40_000) content = content.slice(0, 40_000) + "\n[…truncated…]";
       } catch {
         missing.push(ref);
         continue;
@@ -370,10 +351,26 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     return { text: out, missing };
   };
 
-  // --- /model picker ------------------------------------------------------------------
+  // --- overlays: model picker, history -------------------------------------------------
+  const withOverlay = async <T>(list: SelectList, onPick: (value: string) => Promise<void> | void): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      list.onSelect = (item) => {
+        tui.hideOverlay();
+        tui.setFocus(editor);
+        void Promise.resolve(onPick(item.value)).finally(() => resolve());
+      };
+      list.onCancel = () => {
+        tui.hideOverlay();
+        tui.setFocus(editor);
+        resolve();
+      };
+      tui.showOverlay(list);
+    });
+  };
+
   const pickModel = async (initialFilter?: string) => {
     if (busy) {
-      info("Runs immediately like other commands — but wait for the turn to settle first.");
+      info("Wait for the current turn to settle before switching models.");
       return;
     }
     let models;
@@ -384,65 +381,61 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         apiKey: options.apiKey,
       });
     } catch (error) {
-      print(theme.error(`Model discovery failed: ${error instanceof Error ? error.message : String(error)}`));
+      err(`Model discovery failed: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
     if (models.length === 0) {
-      print(theme.error("No models found. Add providers to ~/.kern/models.json or set KERN_BASE_URL."));
+      err("No models found. Add providers to ~/.kern/models.json or set KERN_BASE_URL.");
       return;
     }
     const current = session.modelInfo();
-    overlayOpen = true;
-    editor.suspend();
-    const overlay = new SelectOverlay(
-      "model",
+    const list = new SelectList(
       [...models]
         .sort((a, b) => Number(b.authenticated) - Number(a.authenticated))
         .map((m) => ({
+          value: `${m.provider}/${m.id}`,
           label: `${m.provider}/${m.id}${m.provider === current.provider && m.id === current.modelId ? "  (current)" : ""}`,
-          hint: `${m.source}${m.authenticated ? "" : " · no credentials"}`,
-          value: m,
+          description: `${m.source}${m.authenticated ? "" : " · no credentials"}`,
         })),
+      10,
+      editorTheme.selectList,
     );
-    if (initialFilter) (overlay as unknown as { filter: string }).filter = initialFilter;
-    const picked = await overlay.run(readKey);
-    overlayOpen = false;
-    if (!picked) {
-      info("Model unchanged.");
-      editor.resume();
+    if (initialFilter) list.setFilter(initialFilter);
+    await withOverlay(list, async (value) => {
+      const slash = value.indexOf("/");
+      const provider = value.slice(0, slash);
+      const id = value.slice(slash + 1);
+      try {
+        const adapter: ModelAdapter = await createAdapterFor(
+          options.modelsFile,
+          provider,
+          id,
+          { baseUrl: options.baseUrl, apiKey: options.apiKey },
+          logger,
+        );
+        await session.setModel(adapter);
+        ok(`Model: ${provider}/${id}`);
+      } catch (error) {
+        err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+  };
+
+  const historySearch = async () => {
+    if (busy) return;
+    const items = recentPrompts.length > 0 ? recentPrompts : [];
+    if (items.length === 0) {
+      info("No history yet.");
       return;
     }
-    try {
-      const adapter: ModelAdapter = await createAdapterFor(
-        options.modelsFile,
-        picked.provider,
-        picked.id,
-        { baseUrl: options.baseUrl, apiKey: options.apiKey },
-        logger,
-      );
-      await session.setModel(adapter);
-      print(theme.success(`Model: ${picked.provider}/${picked.id}`));
-    } catch (error) {
-      print(theme.error(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`));
-    }
-    editor.resume();
+    const list = new SelectList(
+      [...items].reverse().map((h) => ({ value: h, label: h.length > 100 ? h.slice(0, 100) + "…" : h })),
+      10,
+      editorTheme.selectList,
+    );
+    await withOverlay(list, (value) => editor.setText(value));
   };
 
-  // --- history search (Ctrl+R) -----------------------------------------------------------
-  const historySearch = async () => {
-    if (busy || overlayOpen) return;
-    overlayOpen = true;
-    editor.suspend();
-    const items = recentPrompts.length > 0 ? recentPrompts : ["(no history yet)"];
-    const overlay = new SelectOverlay("history", items.map((h) => ({ label: truncateToWidth(h, 100), value: h, disabled: h.startsWith("(") })));
-    const picked = await overlay.run(readKey);
-    overlayOpen = false;
-    if (picked && !picked.startsWith("(")) editor.setText(picked);
-    else editor.resume();
-  };
-  const recentPrompts: string[] = [];
-
-  // --- mode cycle (Shift+Tab) -----------------------------------------------------------------
   const cycleMode = () => {
     if (busy) {
       info("Mode changes apply when idle.");
@@ -451,27 +444,29 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const current = session.approvalMode();
     const next = current === "ask" ? "auto-allowlist" : "ask";
     if (session.setApprovalMode(next as "ask" | "auto-allowlist")) {
-      print(theme.accent(`Approval mode: ${next === "ask" ? "manual (ask)" : "auto (no per-op prompts; destructive still asks)"}`));
+      ok(`Approval mode: ${next === "ask" ? "manual (ask)" : "auto (no per-op prompts; destructive still asks)"}`);
+      printStatus();
     } else {
       info("Approval mode is fixed by the active policy.");
     }
   };
 
-  // --- slash commands ------------------------------------------------------------------------------
+  // --- slash commands -------------------------------------------------------------------
   const runCommand = async (line: string): Promise<boolean> => {
     const [cmd, ...rest] = line.trim().split(/\s+/);
     const arg = rest.join(" ").trim();
     switch (cmd) {
       case "/help":
-        for (const c of COMMANDS) print(`  ${theme.accent(c.name)}  ${theme.muted(c.hint)}`);
+        for (const c of COMMANDS) say(`  ${theme.accent("/" + c.name)}  ${theme.muted(c.description)}`);
         info(HINTS);
         return true;
       case "/quit":
       case "/exit":
         return false;
       case "/clear":
-        process.stdout.write(CLEAR_SCREEN);
+        transcript.clear();
         printHeader();
+        printStatus();
         return true;
       case "/budget":
         printStatus();
@@ -487,9 +482,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         try {
           const result = await session.compact(arg || undefined);
           if (!result) info("Nothing to compact yet.");
-          else print(theme.success(`Compacted through ${result.replacesThroughId}.`));
+          else ok(`Compacted through ${result.replacesThroughId}.`);
         } catch (error) {
-          print(theme.error(`Compaction failed: ${error instanceof Error ? error.message : String(error)}`));
+          err(`Compaction failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         return true;
       }
@@ -497,11 +492,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         try {
           const res = await session.callToolAsUser("bash", { command: "git diff --stat; git status --short | head -20" });
           const text = res.content.map((c) => c.text).join("\n") || "(clean)";
-          print(theme.bold("working tree"));
-          print(text);
+          say(theme.bold("working tree"));
+          say(text);
           if (res.isError) info("Not a git repository, or git failed.");
         } catch (error) {
-          print(theme.error(`Diff failed: ${error instanceof Error ? error.message : String(error)}`));
+          err(`Diff failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         return true;
       }
@@ -517,12 +512,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           manager = fresh.manager;
           queue = [];
           subscribe();
-          await refreshFiles();
-          process.stdout.write(CLEAR_SCREEN);
+          transcript.clear();
           printHeader();
-          info(`New session started (${manager.sessionFile ? basename(manager.sessionFile) : "in-memory"}).`);
+          printStatus();
+          info(`New session started.`);
         } catch (error) {
-          print(theme.error(`New session failed: ${error instanceof Error ? error.message : String(error)}`));
+          err(`New session failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         return true;
       }
@@ -534,45 +529,39 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         try {
           await exportTranscript(arg || undefined);
         } catch (error) {
-          print(theme.error(`Export failed: ${error instanceof Error ? error.message : String(error)}`));
+          err(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         return true;
       }
       default:
-        print(theme.error(`Unknown command: ${cmd ?? ""}. Try /help.`));
+        err(`Unknown command: ${cmd ?? ""}. Try /help.`);
         return true;
     }
   };
 
-  // --- prompt submission -------------------------------------------------------------------------------
+  // --- prompt submission --------------------------------------------------------------------
   const runTurn = (text: string) => {
     busy = true;
     abort = new AbortController();
     activity = "thinking";
-    turnStartedAt = Date.now();
-    lastPrintAt = Date.now();
-    editor.suspend();
-    print(theme.bold("you"));
-    for (const t of text.split("\n")) print(theme.muted(`  ${t}`));
+    setBusy(true);
+    say(theme.bold("you"));
+    say(theme.muted(text));
     session
       .prompt(text, { signal: abort.signal })
       .catch((error: unknown) => {
-        print(theme.error(`Turn failed: ${error instanceof Error ? error.message : String(error)}`));
+        err(`Turn failed: ${error instanceof Error ? error.message : String(error)}`);
       })
       .finally(() => {
+        setBusy(false);
         busy = false;
         abort = null;
-        hideSpinner();
-        queueDraft = null;
         if (!exiting) {
           printStatus();
-          void refreshFiles();
           const next = queue.shift();
           if (next !== undefined) {
             info(`[sending queued message${queue.length > 0 ? ` (+${queue.length} more)` : ""}]`);
             runTurn(next);
-          } else {
-            editor.resume();
           }
         }
       });
@@ -580,73 +569,62 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   /** `!cmd`: run directly, show output, and have the agent respond to it. */
   const runShellMode = async (command: string) => {
-    editor.suspend();
-    print(theme.tool(`◈ !${command}`));
+    say(theme.tool(`◈ !${command}`));
     try {
       const res = await session.callToolAsUser("bash", { command });
       const output = res.content.map((c) => c.text).join("\n");
-      const lines = output.split("\n").slice(0, 60);
-      for (const l of lines) print(theme.muted(`  ${l}`));
+      say(theme.muted(output.split("\n").slice(0, 60).join("\n")));
       if (output.split("\n").length > 60) info(`[…${output.split("\n").length - 60} more lines in context]`);
       runTurn(`I ran \`${command}\` in shell mode. Output:\n${output}\n\nRespond to it.`);
     } catch (error) {
-      print(theme.error(`Shell command failed: ${error instanceof Error ? error.message : String(error)}`));
-      editor.resume();
+      err(`Shell command failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  };
-
-  /** Strip invisible/confusable Unicode. Returns null when clean. */
-  const cleanInvisible = (text: string): { cleaned: string; removed: number } => {
-    const matches = text.match(INVISIBLE_RE);
-    const removed = matches ? matches.length : 0;
-    return { cleaned: text.replace(INVISIBLE_RE, ""), removed };
   };
 
   const submit = (line: string) => {
     if (exiting) return;
-    if (busy) return; // typed input queues via the stdin handler, not submit
-    const raw = line.replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
-    if (!raw.trim()) {
-      editor.resume();
+    if (busy) {
+      const text = line.trim();
+      if (text) {
+        if (queue.length >= MAX_QUEUE) info(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`);
+        else {
+          queue.push(line);
+          info(`[queued ${queue.length}]`);
+        }
+      }
       return;
     }
+    const raw = line.replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
+    if (!raw.trim()) return;
     const trimmed = raw.trim();
     if (trimmed === "?") {
-      void (async () => {
-        editor.suspend();
-        await runCommand("/help");
-        editor.resume();
-      })();
+      void runCommand("/help");
       return;
     }
     if (trimmed.startsWith("!") && !trimmed.startsWith("!=")) {
       const command = trimmed.slice(1).trim();
-      if (!command) {
-        editor.resume();
-        return;
-      }
+      if (!command) return;
       recentPrompts.push(trimmed);
+      editor.addToHistory(trimmed);
       void runShellMode(command);
       return;
     }
     if (trimmed.startsWith("/")) {
+      editor.addToHistory(trimmed);
       void (async () => {
-        editor.suspend();
         let keep = true;
         try {
           keep = await runCommand(trimmed);
         } catch (error) {
-          print(theme.error(String(error)));
+          err(String(error));
         }
-        if (!keep) {
-          void exit();
-          return;
-        }
-        editor.resume();
+        if (!keep) void exit();
       })();
       return;
     }
-    const { cleaned, removed } = cleanInvisible(raw);
+    const matches = raw.match(INVISIBLE_RE);
+    const removed = matches ? matches.length : 0;
+    const cleaned = raw.replace(INVISIBLE_RE, "");
     if (removed > 0) {
       editor.setText(cleaned);
       info(`Removed ${removed} invisible character${removed === 1 ? "" : "s"} · review and press Enter to send.`);
@@ -657,146 +635,78 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       for (const m of missing) info(`@${m}: file not found — sent literally.`);
       recentPrompts.push(raw);
       if (recentPrompts.length > 200) recentPrompts.splice(0, recentPrompts.length - 200);
+      editor.addToHistory(raw);
       runTurn(text);
     })();
   };
 
-  const exit = async () => {
+  editor.onSubmit = submit;
+
+  const exit = () => {
     if (exiting) return;
     exiting = true;
-    clearInterval(spinner);
     abort?.abort();
     options.approvalHook.current = null;
-    process.stdout.write(DISABLE_PASTE);
-    process.stdin.setRawMode(false);
-    process.stdin.pause();
-    process.stdout.write(SHOW_CURSOR);
-    print(theme.muted("bye."));
+    unsubscribe?.();
+    say(theme.muted("bye."));
+    tui.renderNow(true);
+    tui.stop();
+    process.exit(0);
   };
 
   const requestExit = () => {
     const now = Date.now();
     if (now - lastExitAttempt < 800) {
-      void exit();
+      exit();
       return;
     }
     lastExitAttempt = now;
     info("Press Ctrl+D again to exit.");
   };
 
-  // --- stdin -------------------------------------------------------------------------------------
-  process.stdout.write(ENABLE_PASTE);
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  process.stdin.setEncoding("utf8");
-  // Escape-sequence coalescing: an ESC at the end of a chunk may be the head
-  // of an arrow/alt sequence split across reads. Hold it briefly; a lone Esc
-  // (cancel/clear) still resolves after the window.
-  let escTimer: ReturnType<typeof setTimeout> | null = null;
-  let heldChunk = "";
-  const dispatch = (chunk: string) => {
-    for (const key of splitKeys(chunk)) {
-      if (overlayOpen) {
-        const waiter = keyWaiters.shift();
-        if (waiter) waiter(key);
-        else keyQueue.push(key);
-        continue;
-      }
+  // --- global keys ----------------------------------------------------------------------------
+  tui.addInputListener((data) => {
+    if (tui.hasOverlay()) return undefined; // overlays own Esc/arrows/Enter
+    if (matchesKey(data, "ctrl+c")) {
       if (busy) {
-        // Approval prompt reads through readKey even mid-turn.
-        if (keyWaiters.length > 0) {
-          const waiter = keyWaiters.shift();
-          if (waiter) waiter(key);
-          continue;
-        }
-        // Ctrl+C / lone Esc aborts (queued messages still send next).
-        if (key === "\u0003" || key === "\u001b") {
-          abort?.abort();
-          continue;
-        }
-        // Enter queues the draft; other keys build it on the status row.
-        if (key === "\r" || key === "\n") {
-          const text = (queueDraft ?? "").trim();
-          if (text) {
-            if (queue.length >= MAX_QUEUE) {
-              print(theme.muted(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`));
-            } else {
-              queue.push(queueDraft ?? "");
-              queueDraft = null;
-              info(`[queued ${queue.length}]`);
-            }
-          }
-          continue;
-        }
-        if (key === "\u007f" || key === "\b") {
-          if (queueDraft !== null && queueDraft.length > 0) {
-            queueDraft = queueDraft.slice(0, -1);
-            drawStatus();
-          }
-          continue;
-        }
-        if (key === "\u0015") {
-          queueDraft = null;
-          drawStatus();
-          continue;
-        }
-        if (key.startsWith("\u001b[200~")) {
-          const pasted = key.replace(/^\u001b\[200~/, "").replace(/\u001b\[201~$/, "");
-          queueDraft = (queueDraft ?? "") + pasted;
-          drawStatus();
-          continue;
-        }
-        if (key.length === 1 && key >= " " && !/[\u0000-\u001f\u007f]/.test(key)) {
-          queueDraft = (queueDraft ?? "") + key;
-          drawStatus();
-          continue;
-        }
-        continue;
+        abort?.abort();
+        return { consume: true };
       }
-      // approval prompt reads through readKey even when idle
-      if (keyWaiters.length > 0) {
-        const waiter = keyWaiters.shift();
-        if (waiter) waiter(key);
-        continue;
+      if (editor.getText().length === 0) requestExit();
+      else editor.setText("");
+      return { consume: true };
+    }
+    if (matchesKey(data, "ctrl+d")) {
+      if (editor.getText().length === 0) requestExit();
+      return editor.getText().length === 0 ? { consume: true } : undefined;
+    }
+    if (matchesKey(data, "ctrl+s")) {
+      if (editor.getText().length > 0) {
+        stash = editor.getText();
+        editor.setText("");
+      } else if (stash) {
+        editor.setText(stash);
       }
-      if (key === "\u001b[Z") {
-        cycleMode(); // Shift+Tab
-        continue;
-      }
-      editor.handleKey(key);
+      return { consume: true };
     }
-  };
-  process.stdin.on("data", (chunk: string) => {
-    if (escTimer) {
-      clearTimeout(escTimer);
-      escTimer = null;
-      const combined = heldChunk + chunk;
-      heldChunk = "";
-      dispatch(combined);
-      return;
+    if (matchesKey(data, "ctrl+r")) {
+      if (!busy) void historySearch();
+      return { consume: true };
     }
-    if (chunk.endsWith("\u001b")) {
-      heldChunk = chunk;
-      escTimer = setTimeout(() => {
-        escTimer = null;
-        const pending = heldChunk;
-        heldChunk = "";
-        dispatch(pending);
-      }, 40);
-      return;
+    if (matchesKey(data, "ctrl+l")) {
+      tui.requestRender(true);
+      return { consume: true };
     }
-    dispatch(chunk);
+    if (matchesKey(data, "shift+tab")) {
+      if (!busy) cycleMode();
+      return { consume: true };
+    }
+    return undefined;
   });
 
   printHeader();
-  editor.start({
-    onSubmit: submit,
-    onAbort: () => abort?.abort(),
-    onExit: requestExit,
-    onHistorySearch: () => void historySearch(),
-    onModeCycle: cycleMode,
-  });
-
+  printStatus();
+  tui.start();
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (exiting) {
@@ -805,37 +715,4 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
     }, 100);
   });
-}
-
-/** Workspace-relative file list for @ mentions. Skips heavy/ignored dirs. */
-async function listWorkspaceFiles(cwd: string, limit = 3000): Promise<string[]> {
-  const skip = new Set(["node_modules", ".git", "dist", "build", "out", ".next", "coverage", "__pycache__", ".venv", "target"]);
-  const out: string[] = [];
-  const walk = async (dir: string, depth: number): Promise<void> => {
-    if (out.length >= limit || depth > 6) return;
-    let entries;
-    try {
-      entries = await readdir(dir);
-    } catch {
-      return;
-    }
-    for (const name of entries.sort()) {
-      if (out.length >= limit) return;
-      if (name.startsWith(".")) {
-        if (name !== ".agents" && name !== ".kern") continue;
-      }
-      if (skip.has(name)) continue;
-      const abs = join(dir, name);
-      let st;
-      try {
-        st = await stat(abs);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) await walk(abs, depth + 1);
-      else if (st.isFile()) out.push(relative(cwd, abs).split(sep).join("/"));
-    }
-  };
-  await walk(cwd, 0);
-  return out;
 }
