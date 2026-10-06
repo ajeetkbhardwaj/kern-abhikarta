@@ -208,6 +208,9 @@ importers:
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@kern/session-store':
+        specifier: workspace:*
+        version: link:../session-store
 
 packages:
 

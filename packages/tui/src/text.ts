@@ -56,6 +56,31 @@ export function splitKeys(data: string): string[] {
   const keys: string[] = [];
   let i = 0;
   while (i < data.length) {
+    // Bracketed paste: ESC[200~ ... ESC[201~ is one unit.
+    if (data.startsWith("\u001b[200~", i)) {
+      const end = data.indexOf("\u001b[201~", i + 6);
+      if (end === -1) {
+        keys.push(data.slice(i)); // truncated paste; take the rest
+        break;
+      }
+      keys.push(data.slice(i, end + 6));
+      i = end + 6;
+      continue;
+    }
+    // Alt+Enter arrives as ESC CR or ESC LF — one unit (newline, not submit).
+    if (data[i] === "\u001b" && (data[i + 1] === "\r" || data[i + 1] === "\n")) {
+      keys.push(data.slice(i, i + 2));
+      i += 2;
+      continue;
+    }
+    // Alt+letter arrives as ESC + char — one unit (Meta key).
+    if (data[i] === "\u001b" && i + 1 < data.length && data[i + 1] !== "[") {
+      const code = data.codePointAt(i + 1) ?? 0;
+      const len = code > 0xffff ? 2 : 1;
+      keys.push(data.slice(i, i + 1 + len));
+      i += 1 + len;
+      continue;
+    }
     if (data[i] === "\u001b" && data[i + 1] === "[") {
       let j = i + 2;
       while (j < data.length && /[0-9;?]/.test(data[j] ?? "")) j++;

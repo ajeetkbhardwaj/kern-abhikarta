@@ -160,8 +160,37 @@ export class AgentRuntime {
     }
   }
 
+  /**
+   * Compact the active path on demand (e.g. `/compact [note]`).
+   * Returns null — silently, not as an error — when there is nothing to
+   * compact yet. Fails while a turn is running.
+   */
+  async compactNow(instructions?: string): Promise<{ summary: string; replacesThroughId: string } | null> {
+    if (this.busy) throw new Error("Cannot compact while a turn is running");
+    if (!this.compactor) throw new Error("Compaction is disabled for this session");
+    if (!this.sessions.getActiveMessages().length) return null;
+    this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
+    try {
+      const { summary, replacesThroughId } = await this.compactor.compact(this.sessions, this.model, instructions);
+      await this.sessions.appendCompaction(summary, replacesThroughId);
+      this.events.emit({ type: "auto_compaction_end", summary, replacedThroughId: replacesThroughId });
+      return { summary, replacesThroughId };
+    } catch (error) {
+      const serialized = serializeError(error);
+      await this.sessions.appendDiagnostic({
+        severity: "error",
+        code: "E_COMPACTION_FAILED",
+        message: `Manual compaction failed: ${serialized.message}`,
+        details: serialized.details,
+      });
+      this.events.emit({ type: "agent_error", error: serialized });
+      throw error;
+    }
+  }
+
   private async ensureCompactIfNeeded(phase: CompactionPhase, signal?: AbortSignal): Promise<void> {
     if (!this.compactor) return;
+    if (!this.sessions.getActiveMessages().length) return; // nothing yet — stay silent
     const snapshot = await this.contextBuilder.build(this.sessions);
     const decision = this.compactor.evaluate(snapshot, this.model.info.contextWindow);
     if (!decision.shouldCompact) return;

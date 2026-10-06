@@ -11,6 +11,7 @@
   "dependencies": {
     "@kern/protocol": "workspace:*",
     "@kern/coding-agent": "workspace:*",
-    "@kern/model": "workspace:*"
+    "@kern/model": "workspace:*",
+    "@kern/session-store": "workspace:*"
   }
 }

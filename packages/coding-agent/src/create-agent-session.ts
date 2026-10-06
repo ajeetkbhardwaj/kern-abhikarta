@@ -40,6 +40,8 @@ export interface AgentSession {
   isBusy(): boolean;
   setModel(adapter: ModelAdapter): Promise<void>;
   modelInfo(): ModelInfo;
+  /** Manual compaction. Resolves null when there is nothing to compact. */
+  compact(instructions?: string): Promise<{ summary: string; replacesThroughId: string } | null>;
 }
 
 export async function createAgentSession(
@@ -101,6 +103,7 @@ export async function createAgentSession(
     isBusy: () => runtime.isBusy(),
     setModel: (adapter) => runtime.setModel(adapter),
     modelInfo: () => runtime.modelInfo(),
+    compact: (instructions) => runtime.compactNow(instructions),
   };
   return { session, manager };
 }

@@ -93,6 +93,18 @@ export class SessionManager {
     return this.state.activeLeafId;
   }
 
+  /** Session file on disk, if this manager is file-backed. */
+  get sessionFile(): string | null {
+    return this.filePath;
+  }
+
+  /** Session id from the header entry. */
+  get sessionId(): string | null {
+    if (!this.state) return null;
+    const header = this.state.entries.get(this.state.headerId);
+    return header && header.type === "session_header" ? header.sessionId : null;
+  }
+
   getEntry(id: string): SessionEntry | undefined {
     if (!this.state) throw new Error("SessionManager not initialized");
     return this.state.entries.get(id);

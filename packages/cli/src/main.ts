@@ -135,7 +135,7 @@ async function main() {
     });
     process.stderr.write(`[model ${providerName ?? "custom"}/${model} @ ${baseUrl}]\n`);
   }
-  const { session } = await createAgentSession({
+  const sessionOptions = {
     cwd: flags.cwd,
     logger,
     loadResources: !flags.noResources,
@@ -143,9 +143,11 @@ async function main() {
     resume: flags.resume,
     policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
     budgets: flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : undefined,
-    requestApproval: (prompt) => (approvalHook.current ? approvalHook.current(prompt) : askApproval(prompt)),
+    requestApproval: (prompt: string) => (approvalHook.current ? approvalHook.current(prompt) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
-  });
+  };
+  const startSession = () => createAgentSession({ ...sessionOptions });
+  const { session, manager } = await startSession();
 
   const wantInteractive =
     flags.interactive || (!flags.print && !flags.hadPrompt && process.stdin.isTTY && process.stdout.isTTY);
@@ -153,6 +155,8 @@ async function main() {
     const { runInteractive } = await import("@kern/tui");
     await runInteractive({
       session,
+      manager,
+      newSession: startSession,
       modelsFile: file,
       providerName: providerName,
       baseUrl,
