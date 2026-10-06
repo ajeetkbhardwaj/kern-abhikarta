@@ -42,7 +42,7 @@ export interface RunTurnOptions {
 }
 
 export class AgentRuntime {
-  private readonly model: ModelAdapter;
+  private model: ModelAdapter;
   private readonly tools: ToolRegistry;
   private readonly sessions: SessionManager;
   private readonly contextBuilder: ContextBuilder;
@@ -69,6 +69,36 @@ export class AgentRuntime {
 
   budgetUsage() {
     return this.budgets.usage();
+  }
+
+  /** Hot-swap the model adapter mid-session (drives `/model`). Persisted. */
+  async setModel(adapter: ModelAdapter): Promise<void> {
+    this.model = adapter;
+    await this.sessions.appendModelChange(adapter.info.provider, adapter.info.modelId);
+    this.logger.info("model_switched", { provider: adapter.info.provider, model: adapter.info.modelId });
+  }
+
+  /** Manual compaction (e.g. `/compact`). Independent of the auto gate. */
+  async compact(instructions?: string, signal?: AbortSignal): Promise<{ summary: string; replacesThroughId: string }> {
+    if (!this.compactor) throw new Error("Compaction is disabled for this session");
+    this.throwIfAborted(signal);
+    this.events.emit({ type: "auto_compaction_start", phase: "before_prompt" });
+    try {
+      const result = await this.compactor.compact(this.sessions, this.model, instructions);
+      this.throwIfAborted(signal);
+      await this.sessions.appendCompaction(result.summary, result.replacesThroughId);
+      this.events.emit({ type: "auto_compaction_end", summary: result.summary, replacedThroughId: result.replacesThroughId });
+      return result;
+    } catch (error) {
+      const serialized = serializeError(error);
+      await this.sessions.appendDiagnostic({
+        severity: "error",
+        code: "E_COMPACTION_FAILED",
+        message: `Manual compaction failed: ${serialized.message}`,
+        details: serialized.details,
+      });
+      throw error;
+    }
   }
 
   async runUserTurn(userText: string, opts: RunTurnOptions = {}): Promise<void> {

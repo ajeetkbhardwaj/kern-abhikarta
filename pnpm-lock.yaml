@@ -142,6 +142,9 @@ importers:
       '@kern/coding-agent':
         specifier: workspace:*
         version: link:../coding-agent
+      '@kern/model':
+        specifier: workspace:*
+        version: link:../model
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol

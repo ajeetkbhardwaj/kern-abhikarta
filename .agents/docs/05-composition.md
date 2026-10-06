@@ -36,8 +36,14 @@ build on these three methods.
 ## 5.2 CLI (`@kern/cli`, print mode)
 
 Thin by design: parse flags → create session → subscribe → prompt.
-Flags: `--read-only` (allowlist `read` only), `--max-turns N`, `--cwd DIR`,
-`--no-resources`, `--no-compaction`, `--resume`, `--help`.
+Model flags (OpenAI-compatible — OpenAI, NVIDIA, local servers):
+`--model/--api-key/--base-url/--nvidia/--context-window/--list-models`
+(env fallback: `KERN_MODEL`, `KERN_API_KEY`/`OPENAI_API_KEY`/
+`NVIDIA_API_KEY`, `KERN_BASE_URL`/`OPENAI_BASE_URL`).
+Session flags: `--read-only`, `--max-turns N`, `--cwd DIR`,
+`--no-resources`, `--no-compaction`, `--resume`.
+`-i` starts an interactive REPL with `/model` (list/switch via API),
+`/compact`, `/budget`, `/new`, `/help`, `/quit`; Ctrl+C aborts the turn.
 
 Two rules the CLI follows that every future UI must copy:
 

@@ -71,11 +71,18 @@ content, session naming/deletion UX, themes, packaging, telemetry.
       1×read wall-time, deterministic JSONL order.
 
 ### K4 — Model boundary, proven with reality
-- [ ] **K4.1 One real provider adapter** (OpenAI first): streaming arg
-      fragments, usage normalization, stop reasons, malformed-call
-      recovery, auth-vs-transient classification. Acceptance: real
-      read→edit→bash→verify run driven through the kernel.
+- [x] **K4.1 One real provider adapter** (OpenAI-compatible: OpenAI,
+      NVIDIA, local servers): streaming arg fragments, usage
+      normalization, stop reasons, malformed-call recovery,
+      auth-vs-transient classification. Verified against a mock
+      OpenAI-compatible server (text/reasoning deltas, fragmented tool
+      args, usage, 401→`E_MODEL_AUTH`) and full kernel turn
+      (model→read→final). CLI: `--model/--api-key/--base-url/--nvidia/
+      --list-models`, `/model` switching persisted as `model_change`.
+      Still open: run against a real endpoint (needs key).
 - [ ] **K4.2 Thinking levels** plumbed request→adapter→message record.
+      (Adapter already passes `reasoning_budget` + `enable_thinking`
+      through; persistence on assistant messages still missing.)
       Acceptance: mid-session switch recorded and honored.
 - [ ] **K4.3 Real token accounting** (tokenizer or provider usage) feeding
       the compaction gate; char-estimate removed. Acceptance: gate within

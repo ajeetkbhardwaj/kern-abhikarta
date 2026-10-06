@@ -10,6 +10,7 @@
   "types": "./src/index.ts",
   "dependencies": {
     "@kern/protocol": "workspace:*",
-    "@kern/coding-agent": "workspace:*"
+    "@kern/coding-agent": "workspace:*",
+    "@kern/model": "workspace:*"
   }
 }
