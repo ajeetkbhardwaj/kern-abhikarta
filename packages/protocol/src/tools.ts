@@ -22,7 +22,7 @@ export interface ToolContext {
   workspaceRoot: string;
   signal: AbortSignal;
   /** Approval request sink. Absent in fully headless/read-only deployments. */
-  requestApproval?: (prompt: string) => Promise<boolean>;
+  requestApproval?: (prompt: string, meta?: { toolName: string; origin: string }) => Promise<boolean | "session">;
   emitProgress: (delta: string) => void;
 }
 

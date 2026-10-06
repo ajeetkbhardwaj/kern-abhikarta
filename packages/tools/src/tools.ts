@@ -30,12 +30,17 @@ export interface ToolRegistryOptions {
   /** Registry-level timeout per tool call. Aborts the tool's signal. */
   maxToolMs?: number;
   /** Fallback approval handler when policy demands approval. */
-  requestApproval?: (prompt: string) => Promise<boolean>;
+  requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
+}
+
+export interface ApprovalMeta {
+  toolName: string;
+  origin: string;
 }
 
 export interface ExecuteOptions {
   origin?: PolicyInput["origin"];
-  requestApproval?: (prompt: string) => Promise<boolean>;
+  requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
 }
 
 export class ToolRegistry {
@@ -43,7 +48,7 @@ export class ToolRegistry {
   private policy: ToolPolicyEngine;
   private workspaceRoot: string;
   private maxToolMs: number;
-  private requestApproval?: (prompt: string) => Promise<boolean>;
+  private requestApproval?: (prompt: string, meta?: ApprovalMeta) => Promise<boolean | "session">;
 
   constructor(options: ToolRegistryOptions) {
     this.policy = options.policy ?? new DefaultPolicy();
@@ -62,6 +67,28 @@ export class ToolRegistry {
 
   has(name: string): boolean {
     return this.tools.has(name);
+  }
+
+  toolNames(): string[] {
+    return [...this.tools.keys()];
+  }
+
+  /** Direct tool invocation for TUI shell mode etc. Same pipeline as model calls. */
+  async callTool(
+    name: string,
+    args: unknown,
+    opts: ExecuteOptions & { signal?: AbortSignal; origin?: PolicyInput["origin"] } = {},
+  ): Promise<ToolResult> {
+    return this.execute(name, args, opts.signal ?? new AbortController().signal, opts);
+  }
+
+  /** Mutate the policy when it is a DefaultPolicy (no-op otherwise). */
+  configurePolicy(mutator: (policy: DefaultPolicy) => void): boolean {
+    if (this.policy instanceof DefaultPolicy) {
+      mutator(this.policy);
+      return true;
+    }
+    return false;
   }
 
   listModelSchemas(): ModelToolSchema[] {
@@ -99,11 +126,15 @@ export class ToolRegistry {
       if (!handler) {
         return textResult(`Approval required: ${policy.prompt}`, true, { code: "E_TOOL_DENIED" });
       }
-      let approved = false;
+      let approved: boolean | "session" = false;
       try {
-        approved = await handler(policy.prompt);
+        approved = await handler(policy.prompt, { toolName: name, origin });
       } catch {
         approved = false;
+      }
+      if (approved === "session") {
+        this.configurePolicy((p) => p.allowForSession(name));
+        approved = true;
       }
       if (!approved) {
         return textResult(`Denied by approver: ${policy.prompt}`, true, { code: "E_TOOL_DENIED" });

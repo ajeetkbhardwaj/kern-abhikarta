@@ -98,7 +98,7 @@ async function main() {
   const baseUrl = flags.baseUrl ?? process.env["KERN_BASE_URL"];
   const apiKey = flags.apiKey ?? process.env["KERN_API_KEY"];
   const file = await loadModelsFile(flags.cwd);
-  const approvalHook: { current: ((prompt: string) => Promise<boolean>) | null } = { current: null };
+  const approvalHook: { current: ((prompt: string, meta?: { toolName: string }) => Promise<boolean | "session">) | null } = { current: null };
 
   if (flags.listModels) {
     const models = await discoverModels(file, { provider, baseUrl, apiKey });
@@ -143,7 +143,7 @@ async function main() {
     resume: flags.resume,
     policy: flags.readOnly ? { allowlistTools: ["read"] } : undefined,
     budgets: flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : undefined,
-    requestApproval: (prompt: string) => (approvalHook.current ? approvalHook.current(prompt) : askApproval(prompt)),
+    requestApproval: (prompt: string, meta?: { toolName: string }) => (approvalHook.current ? approvalHook.current(prompt, meta) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
   };
   const startSession = () => createAgentSession({ ...sessionOptions });

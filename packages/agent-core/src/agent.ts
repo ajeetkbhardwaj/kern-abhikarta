@@ -13,6 +13,7 @@ import type {
   ModelErrorKind,
   CompactionPhase,
 } from "@kern/protocol";
+import type { ContextUsage } from "./tokens.js";
 import {
   nullLogger,
   AssistantMessageAssembler,
@@ -35,7 +36,7 @@ export interface AgentRuntimeOptions {
   compactor?: Compactor | null;
   retry?: RetryConfig;
   /** Called when policy demands approval. Absent = deny. */
-  requestApproval?: (prompt: string) => Promise<boolean>;
+  requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
 }
 
 export interface RunTurnOptions {
@@ -52,9 +53,10 @@ export class AgentRuntime {
   private readonly budgets: BudgetTracker;
   private readonly compactor: Compactor | null;
   private readonly retry: RetryConfig;
-  private readonly requestApproval?: (prompt: string) => Promise<boolean>;
+  private readonly requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
   private busy = false;
   private turn = 0;
+  private lastUsage: ContextUsage | null = null;
 
   constructor(options: AgentRuntimeOptions) {
     this.model = options.model;
@@ -71,6 +73,37 @@ export class AgentRuntime {
 
   budgetUsage() {
     return this.budgets.usage();
+  }
+
+  /** Token usage of the most recent context build (null before first turn). */
+  contextUsage(): ContextUsage | null {
+    return this.lastUsage;
+  }
+
+  /** Approval-mode + session-allow passthroughs (Shift+Tab cycling, dialogs). */
+  approvalMode(): string {
+    let mode = "ask";
+    this.tools.configurePolicy((p) => {
+      mode = p.approvalMode();
+    });
+    return mode;
+  }
+
+  setApprovalMode(mode: "ask" | "never" | "auto-allowlist"): boolean {
+    return this.tools.configurePolicy((p) => p.setApprovalMode(mode));
+  }
+
+  allowToolForSession(toolName: string): boolean {
+    return this.tools.configurePolicy((p) => p.allowForSession(toolName));
+  }
+
+  toolNames(): string[] {
+    return this.tools.toolNames();
+  }
+
+  /** Direct tool call with user origin (shell mode). */
+  callToolAsUser(name: string, args: unknown, signal?: AbortSignal) {
+    return this.tools.callTool(name, args, { origin: "user", signal, requestApproval: this.requestApproval });
   }
 
   isBusy(): boolean {
@@ -107,6 +140,7 @@ export class AgentRuntime {
         this.events.emit({ type: "turn_start", turn: this.turn });
 
         const ctx = await this.contextBuilder.build(this.sessions);
+        this.lastUsage = ctx.usage;
         const request = {
           systemPrompt: ctx.systemPrompt,
           messages: ctx.messages,

@@ -10,8 +10,8 @@ import {
   DEFAULT_POLICY_CONFIG,
   type PolicyConfig,
 } from "@kern/tools";
-import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener } from "@kern/protocol";
-import type { BudgetLimits } from "@kern/agent-core";
+import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult } from "@kern/protocol";
+import type { BudgetLimits, ContextUsage } from "@kern/agent-core";
 
 export interface CreateAgentSessionOptions {
   cwd: string;
@@ -22,7 +22,7 @@ export interface CreateAgentSessionOptions {
   /** Resource budgets. Conservative defaults apply when omitted. */
   budgets?: Partial<BudgetLimits>;
   /** Approval callback for write/exec/destructive ops. Absent = deny. */
-  requestApproval?: (prompt: string) => Promise<boolean>;
+  requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
   /** Load AGENTS.md + skill catalog into the system prompt. Default true. */
   loadResources?: boolean;
   /** Compact automatically at safe boundaries. Default true. */
@@ -42,6 +42,13 @@ export interface AgentSession {
   modelInfo(): ModelInfo;
   /** Manual compaction. Resolves null when there is nothing to compact. */
   compact(instructions?: string): Promise<{ summary: string; replacesThroughId: string } | null>;
+  /** Token usage of the most recent context build. */
+  contextUsage(): ContextUsage | null;
+  approvalMode(): string;
+  setApprovalMode(mode: "ask" | "never" | "auto-allowlist"): boolean;
+  allowToolForSession(toolName: string): boolean;
+  toolNames(): string[];
+  callToolAsUser(name: string, args: unknown, signal?: AbortSignal): Promise<ToolResult>;
 }
 
 export async function createAgentSession(
@@ -104,6 +111,12 @@ export async function createAgentSession(
     setModel: (adapter) => runtime.setModel(adapter),
     modelInfo: () => runtime.modelInfo(),
     compact: (instructions) => runtime.compactNow(instructions),
+    contextUsage: () => runtime.contextUsage(),
+    approvalMode: () => runtime.approvalMode(),
+    setApprovalMode: (mode) => runtime.setApprovalMode(mode),
+    allowToolForSession: (toolName) => runtime.allowToolForSession(toolName),
+    toolNames: () => runtime.toolNames(),
+    callToolAsUser: (name, args, signal) => runtime.callToolAsUser(name, args, signal),
   };
   return { session, manager };
 }

@@ -18,7 +18,26 @@ export class AllowAllPolicy implements ToolPolicyEngine {
   }
 }
 export class DefaultPolicy implements ToolPolicyEngine {
+  private readonly sessionAllowed = new Set<string>();
+
   constructor(private config: PolicyConfig = DEFAULT_POLICY_CONFIG) {}
+
+  /** Don't ask again for this tool for the rest of the session. */
+  allowForSession(toolName: string): void {
+    this.sessionAllowed.add(toolName);
+  }
+
+  setApprovalMode(mode: PolicyConfig["approvalMode"]): void {
+    this.config = { ...this.config, approvalMode: mode };
+  }
+
+  approvalMode(): PolicyConfig["approvalMode"] {
+    return this.config.approvalMode;
+  }
+
+  sessionAllowlist(): string[] {
+    return [...this.sessionAllowed];
+  }
 
   async evaluate(input: PolicyInput): Promise<PolicyDecision> {
     const name = input.toolName;
@@ -34,16 +53,17 @@ export class DefaultPolicy implements ToolPolicyEngine {
         return { decision: "deny", reason: "Access to sensitive path is blocked" };
       }
     }
+    const auto = this.config.approvalMode === "auto-allowlist" || this.sessionAllowed.has(name);
     if (name === "bash" && args && typeof args.command === "string") {
       const cmd = args.command;
       if (DESTRUCTIVE_PATTERNS.some((re) => re.test(cmd))) {
         return { decision: "require_approval", prompt: `Destructive command detected. Approve? ${cmd}` };
       }
-      if (this.config.approvalMode === "ask") {
+      if (this.config.approvalMode === "ask" && !auto) {
         return { decision: "require_approval", prompt: `Approve bash command? ${cmd}` };
       }
     }
-    if ((name === "write" || name === "edit") && this.config.approvalMode === "ask") {
+    if ((name === "write" || name === "edit") && this.config.approvalMode === "ask" && !auto) {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
     return { decision: "allow" };

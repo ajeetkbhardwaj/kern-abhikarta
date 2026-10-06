@@ -15,6 +15,16 @@ import { truncateToWidth, terminalWidth, splitKeys, visibleWidth } from "./text.
 export interface LineEditorOptions {
   prompt?: string;
   history?: string[];
+  /** Completion for the token at the cursor. Returns text to insert + ghost remainder. */
+  completer?: (beforeCursor: string) => { insert: string; ghost: string } | null;
+}
+
+export interface EditorCallbacks {
+  onSubmit: (line: string) => void;
+  onAbort: () => void;
+  onExit: () => void;
+  onHistorySearch?: () => void;
+  onModeCycle?: () => void;
 }
 
 const UP_LINE = (n: number) => (n > 0 ? `\u001b[${n}A` : "");
@@ -32,11 +42,17 @@ export class LineEditor {
   private onSubmit: ((line: string) => void) | null = null;
   private onAbort: (() => void) | null = null;
   private onExit: (() => void) | null = null;
+  private onHistorySearch: (() => void) | null = null;
+  private onModeCycle: (() => void) | null = null;
   private pasteBuf: string | null = null;
+  private stash = "";
+  private yank = "";
+  private readonly completer?: LineEditorOptions["completer"];
 
   constructor(options: LineEditorOptions = {}) {
     this.prompt = options.prompt ?? "> ";
     this.history = options.history ?? [];
+    this.completer = options.completer;
   }
 
   pushHistory(line: string): void {
@@ -45,10 +61,12 @@ export class LineEditor {
     if (this.history.length > 200) this.history.splice(0, this.history.length - 200);
   }
 
-  start(handlers: { onSubmit: (line: string) => void; onAbort: () => void; onExit: () => void }): void {
+  start(handlers: EditorCallbacks): void {
     this.onSubmit = handlers.onSubmit;
     this.onAbort = handlers.onAbort;
     this.onExit = handlers.onExit;
+    this.onHistorySearch = handlers.onHistorySearch ?? null;
+    this.onModeCycle = handlers.onModeCycle ?? null;
     this.active = true;
     this.buffer = "";
     this.cursor = 0;
@@ -89,6 +107,8 @@ export class LineEditor {
       this.redraw();
       return true;
     }
+    // Enter submits. Some environments deliver CR, others LF (Ctrl+J is
+    // therefore also submit); use Alt+Enter for a literal newline.
     if (data === "\r" || data === "\n") {
       const line = this.buffer;
       this.pushHistory(line);
@@ -189,28 +209,65 @@ export class LineEditor {
       return true;
     }
     if (data === "\u0017") {
-      // Ctrl+W: delete word back
-      const start = this.wordStart(-1);
+      // Ctrl+W: delete back to previous whitespace (whole paths/flags at once).
+      let start = this.cursor;
+      while (start > 0 && /\s/.test(this.buffer[start - 1] ?? "")) start--;
+      while (start > 0 && !/\s/.test(this.buffer[start - 1] ?? "")) start--;
+      this.yank = this.buffer.slice(start, this.cursor);
       this.buffer = this.buffer.slice(0, start) + this.buffer.slice(this.cursor);
       this.cursor = start;
       this.redraw();
       return true;
     }
     if (data === "\u001b[3;5~" || data === "\u001bd") {
-      // Ctrl+Delete / Alt+D: delete word forward
+      // Ctrl+Delete / Alt+D: delete word forward (stored for Ctrl+Y).
       const end = this.wordStart(1);
+      this.yank = this.buffer.slice(this.cursor, end);
       this.buffer = this.buffer.slice(0, this.cursor) + this.buffer.slice(end);
       this.redraw();
       return true;
     }
     if (data === "\u000b") {
-      // Ctrl+K: kill to end of line
+      // Ctrl+K: kill to end of line (stored for Ctrl+Y).
+      this.yank = this.buffer.slice(this.cursor);
       this.buffer = this.buffer.slice(0, this.cursor);
       this.redraw();
       return true;
     }
+    if (data === "\u0019") {
+      // Ctrl+Y: paste last killed text.
+      if (this.yank) {
+        this.insert(this.yank);
+        this.redraw();
+      }
+      return true;
+    }
+    if (data === "\u0012") {
+      // Ctrl+R: reverse history search (handled by orchestrator overlay).
+      this.onHistorySearch?.();
+      return true;
+    }
+    if (data === "\u000c") {
+      // Ctrl+L: redraw the input block (recover from garble).
+      this.redraw();
+      return true;
+    }
+    if (data === "\u0013") {
+      // Ctrl+S: stash prompt / restore stashed prompt.
+      if (this.buffer.length > 0) {
+        this.stash = this.buffer;
+        this.buffer = "";
+        this.cursor = 0;
+      } else if (this.stash) {
+        this.buffer = this.stash;
+        this.cursor = this.buffer.length;
+      }
+      this.redraw();
+      return true;
+    }
     if (data === "\u0015") {
-      // Ctrl+U: clear all
+      // Ctrl+U: clear all (stored for Ctrl+Y).
+      this.yank = this.buffer;
       this.buffer = "";
       this.cursor = 0;
       this.redraw();
@@ -227,6 +284,15 @@ export class LineEditor {
     }
     if (data.startsWith("\u001b")) return true; // swallow other escape sequences
     if (data === "\t") {
+      // Tab: accept ghost completion when the cursor is at the end.
+      if (this.completer && this.cursor === this.buffer.length) {
+        const c = this.completer(this.buffer);
+        if (c && c.insert) {
+          this.insert(c.insert);
+          this.redraw();
+          return true;
+        }
+      }
       this.insert("  ");
       this.redraw();
       return true;
@@ -237,6 +303,18 @@ export class LineEditor {
       return true;
     }
     return true;
+  }
+
+  /** Replace the whole buffer (history search accept, cleaned paste). */
+  setText(s: string): void {
+    this.buffer = s;
+    this.cursor = s.length;
+    this.historyIndex = -1;
+    if (this.active) this.redraw();
+  }
+
+  getText(): string {
+    return this.buffer;
   }
 
   private insert(s: string): void {
@@ -259,7 +337,8 @@ export class LineEditor {
   }
 
   private isWordChar(ch: string): boolean {
-    return /[A-Za-z0-9_]/.test(ch);
+    // Letters + digits only: punctuation (/, ., _, -) separates words.
+    return /[A-Za-z0-9]/.test(ch);
   }
 
   private wordStart(dir: -1 | 1): number {
@@ -314,6 +393,12 @@ export class LineEditor {
     if (!this.active) return;
     const width = terminalWidth();
     const lines = this.buffer.split("\n");
+    // Ghost completion: shown dim after the cursor, only at end of input.
+    let ghost = "";
+    if (this.completer && this.cursor === this.buffer.length) {
+      const c = this.completer(this.buffer);
+      if (c && c.ghost) ghost = theme.muted(c.ghost);
+    }
     // Cursor row/col in block coordinates.
     let cursorRow = 0;
     {
@@ -331,7 +416,7 @@ export class LineEditor {
     // Rewrite the block from its first row.
     process.stdout.write(UP_LINE(lines.length - 1));
     for (let r = 0; r < lines.length; r++) {
-      let text = ((r === 0 ? this.prompt : "") + (lines[r] ?? "")) || " ";
+      let text = ((r === 0 ? this.prompt : "") + (lines[r] ?? "") + (r === lines.length - 1 ? ghost : "")) || " ";
       if (r === 0 && this.buffer.startsWith("/")) {
         const raw = lines[r] ?? "";
         const space = raw.indexOf(" ");
@@ -354,10 +439,24 @@ export class LineEditor {
 
   suspend(): void {
     this.active = false;
+    this.conceal();
+  }
+
+  /** Erase the block from the screen, keeping buffer/cursor (for prints). */
+  conceal(): void {
     // Clear the whole block.
     const lines = this.buffer.split("\n");
     process.stdout.write(UP_LINE(lines.length - 1));
     for (let i = 0; i < lines.length; i++) process.stdout.write(CLEAR_LINE + (i < lines.length - 1 ? "\u001b[1B" : "\r"));
+  }
+
+  /** Redraw the block without touching buffer/cursor. */
+  reveal(): void {
+    if (this.active) this.redraw();
+  }
+
+  isEmpty(): boolean {
+    return this.buffer.length === 0;
   }
 
   resume(): void {
