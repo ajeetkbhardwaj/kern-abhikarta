@@ -14,7 +14,7 @@
  * credentials are selectable — same rule as Pi.
  */
 
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { KernError, type Logger } from "@kern/protocol";
@@ -36,6 +36,12 @@ export interface ProviderConfig {
   /** Env var holding the key (default per well-known provider). */
   apiKeyEnv?: string;
   models?: ModelEntry[];
+  /** Human-friendly label for pickers (falls back to the provider key). */
+  displayName?: string;
+  /** Model ids to hide (applied after whitelist, to configured + live ids). */
+  blacklist?: string[];
+  /** When non-empty, only these model ids are shown (configured + live). */
+  whitelist?: string[];
 }
 
 export interface ModelsFile {
@@ -68,35 +74,158 @@ export function userModelsFile(): string {
   return join(homedir(), ".kern", "models.json");
 }
 
+export interface ProviderAuth {
+  apiKey?: string;
+}
+
+export function authFilePath(): string {
+  return join(homedir(), ".kern", "auth.json");
+}
+
+function lastUsedFilePath(): string {
+  return join(homedir(), ".kern", "last-used.json");
+}
+
+/** Process-local cache so resolveApiKey doesn't re-read auth.json per call. */
+let authCache: Record<string, ProviderAuth> | null = null;
+
+/** Missing file → `{}`; corrupt JSON throws E_RESOURCE_LOAD. */
+export async function loadAuth(): Promise<Record<string, ProviderAuth>> {
+  const path = authFilePath();
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+    throw error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new KernError("E_RESOURCE_LOAD", `Invalid JSON in ${path}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new KernError("E_RESOURCE_LOAD", `Invalid JSON in ${path}`);
+  }
+  return parsed as Record<string, ProviderAuth>;
+}
+
+/** Merge one key into ~/.kern/auth.json (dir 0700, file 0600). */
+export async function saveAuthKey(provider: string, apiKey: string): Promise<void> {
+  await mkdir(join(homedir(), ".kern"), { recursive: true, mode: 0o700 });
+  let existing: Record<string, ProviderAuth> = {};
+  try {
+    existing = await loadAuth();
+  } catch {
+    existing = {};
+  }
+  const next = { ...existing, [provider]: { ...(existing[provider] ?? {}), apiKey } };
+  const path = authFilePath();
+  await writeFile(path, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  try {
+    await chmod(path, 0o600);
+  } catch {
+    // best effort (non-POSIX fs)
+  }
+  authCache = next;
+}
+
+export async function clearAuthKey(provider: string): Promise<void> {
+  let existing: Record<string, ProviderAuth> = {};
+  try {
+    existing = await loadAuth();
+  } catch {
+    existing = {};
+  }
+  if (!(provider in existing)) {
+    authCache = existing;
+    return;
+  }
+  const next = { ...existing };
+  delete next[provider];
+  await mkdir(join(homedir(), ".kern"), { recursive: true, mode: 0o700 });
+  const path = authFilePath();
+  await writeFile(path, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  try {
+    await chmod(path, 0o600);
+  } catch {
+    // best effort (non-POSIX fs)
+  }
+  authCache = next;
+}
+
+export async function recordLastUsed(provider: string, model: string): Promise<void> {
+  await mkdir(join(homedir(), ".kern"), { recursive: true, mode: 0o700 });
+  const path = lastUsedFilePath();
+  await writeFile(path, JSON.stringify({ provider, model }) + "\n", { mode: 0o600 });
+  try {
+    await chmod(path, 0o600);
+  } catch {
+    // best effort (non-POSIX fs)
+  }
+}
+
+export async function readLastUsed(): Promise<{ provider: string; model: string } | null> {
+  let text: string;
+  try {
+    text = await readFile(lastUsedFilePath(), "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text) as { provider?: unknown; model?: unknown };
+    if (typeof parsed?.provider !== "string" || typeof parsed?.model !== "string") return null;
+    return { provider: parsed.provider, model: parsed.model };
+  } catch {
+    return null;
+  }
+}
+
 /** Test a base URL + key, returning friendly failures (never throws raw). */
 export async function testProvider(
   baseUrl: string,
   apiKey: string | undefined,
-  options: ListModelsOptions = {},
+  options?: ListModelsOptions,
 ): Promise<{ ok: true; models: string[] } | { ok: false; message: string }> {
-  let normalized = baseUrl.trim().replace(/\/+$/, "");
+  const opts = options ?? {};
+  const timeoutS = Math.round((opts.timeoutMs ?? 10_000) / 1000);
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
   if (!/^https?:\/\//i.test(normalized)) {
     return { ok: false, message: `Bad URL ${JSON.stringify(baseUrl)} — must start with http:// or https://.` };
   }
   try {
-    const models = await listRemoteModels(normalized, apiKey, { timeoutMs: 10_000, ...options });
+    const models = await listRemoteModels(normalized, apiKey, { timeoutMs: 10_000, ...opts });
+    if (models.length === 0) {
+      return {
+        ok: false,
+        message: `Unexpected response body from ${normalized} (no models listed). You can still add a model id manually.`,
+      };
+    }
     return { ok: true, models };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (/ENOTFOUND|ECONNREFUSED|EHOSTUNREACH/i.test(msg)) {
       return { ok: false, message: `Can't reach ${normalized}. Is the server running?` };
     }
-    if (/HTTP 401|HTTP 403/.test(msg)) {
-      return { ok: false, message: `Key rejected (HTTP 401). Check the key, $VAR, or command output.` };
+    const status = msg.match(/HTTP (401|403)\b/)?.[1];
+    if (status === "401" || status === "403") {
+      return { ok: false, message: `Key rejected (HTTP ${status}). Check the key, $VAR, or command output.` };
     }
     if (/abort|timeout|timed out/i.test(msg)) {
-      return { ok: false, message: `Timed out after 10s — behind a proxy/VPN, or wrong host?` };
+      return { ok: false, message: `Timed out after ${timeoutS}s — behind a proxy/VPN, or wrong host?` };
+    }
+    if (/not valid JSON|unexpected token|unexpected end|\bparse\b/i.test(msg)) {
+      return {
+        ok: false,
+        message: `Unexpected response body from ${normalized} (${msg.slice(0, 120)}). You can still add a model id manually.`,
+      };
     }
     return { ok: false, message: msg.slice(0, 200) };
   }
 }
 
-function maskKey(raw: string): string {
+export function maskKey(raw: string): string {
   const t = raw.trim();
   if (t.startsWith("!") || t.startsWith("$")) return t;
   if (t.length <= 8) return "••••";
@@ -105,22 +234,37 @@ function maskKey(raw: string): string {
 
 /**
  * Save (or replace) one provider in ~/.kern/models.json. Creates ~/.kern
- * (0700); uses 0600 file mode when a literal secret is stored. Masks keys
- * in the returned summary — never log raw secrets.
+ * (0700). Literal secrets are NEVER written here — a literal `apiKey` is
+ * moved to ~/.kern/auth.json (0600) via saveAuthKey; only `!command` /
+ * `$VAR` references stay in the models file. Masks keys in the returned
+ * summary — never log raw secrets.
  */
 export async function saveProviderToUserFile(
   name: string,
   cfg: ProviderConfig,
-  makeDefault = false,
+  opts?: { makeDefault?: boolean },
 ): Promise<{ path: string; summary: string }> {
-  if (!/^[a-z0-9-]{1,32}$/.test(name)) {
-    throw new KernError("E_MODEL_REQUEST", `Bad provider name ${JSON.stringify(name)} — use [a-z0-9-].`);
+  if (!/^[a-z0-9.-]{1,32}$/.test(name)) {
+    throw new KernError("E_MODEL_REQUEST", `Bad provider name ${JSON.stringify(name)} — use [a-z0-9.-], max 32 chars.`);
   }
   if (!/^https?:\/\//i.test(cfg.baseUrl.trim())) {
     throw new KernError("E_MODEL_REQUEST", `Bad baseUrl ${JSON.stringify(cfg.baseUrl)}.`);
   }
+  const { apiKey: rawKey, ...rest } = cfg;
+  const trimmed = rawKey?.trim() ?? "";
+  const isReference = trimmed.startsWith("!") || trimmed.startsWith("$");
+  const storedCfg: ProviderConfig = { ...rest };
+  let keyNote: string;
+  if (rawKey !== undefined && trimmed !== "" && !isReference) {
+    await saveAuthKey(name, trimmed);
+    keyNote = `key ${maskKey(trimmed)} (stored in auth.json)`;
+  } else if (rawKey !== undefined && isReference) {
+    storedCfg.apiKey = rawKey;
+    keyNote = `key ${maskKey(rawKey)}`;
+  } else {
+    keyNote = cfg.apiKeyEnv ? `env ${cfg.apiKeyEnv}` : "no key";
+  }
   const path = userModelsFile();
-  const { mkdir, writeFile, chmod } = await import("node:fs/promises");
   await mkdir(join(homedir(), ".kern"), { recursive: true, mode: 0o700 });
   let file: ModelsFile = {};
   try {
@@ -128,20 +272,13 @@ export async function saveProviderToUserFile(
   } catch {
     file = {};
   }
-  file.providers = { ...(file.providers ?? {}), [name]: cfg };
-  if (makeDefault) {
+  file.providers = { ...(file.providers ?? {}), [name]: storedCfg };
+  if (opts?.makeDefault) {
     file.defaultProvider = name;
-    const first = cfg.models?.[0]?.id;
+    const first = storedCfg.models?.[0]?.id;
     if (first) file.defaultModel = first;
   }
-  const hasLiteralSecret = !!cfg.apiKey && !cfg.apiKey.trim().startsWith("!") && !cfg.apiKey.trim().startsWith("$");
-  await writeFile(path, JSON.stringify(file, null, 2) + "\n", { mode: hasLiteralSecret ? 0o600 : 0o644 });
-  try {
-    await chmod(path, hasLiteralSecret ? 0o600 : 0o644);
-  } catch {
-    // best effort (non-POSIX fs)
-  }
-  const keyNote = cfg.apiKey ? `key ${maskKey(cfg.apiKey)}` : cfg.apiKeyEnv ? `env ${cfg.apiKeyEnv}` : "no key";
+  await writeFile(path, JSON.stringify(file, null, 2) + "\n");
   return { path, summary: `${name} → ${cfg.baseUrl} (${keyNote})` };
 }
 
@@ -195,8 +332,9 @@ function mergeProvider(prev: ProviderConfig | undefined, next: ProviderConfig): 
 }
 
 /**
- * Credential precedence: explicit arg > `!command` / `$VAR` / literal in
- * config > provider env var > loopback-localhost without a key.
+ * Credential precedence: explicit arg > auth.json entry > `!command` /
+ * `$VAR` / literal in config > provider env var > loopback-localhost
+ * without a key.
  */
 export async function resolveApiKey(
   providerName: string,
@@ -204,6 +342,15 @@ export async function resolveApiKey(
   explicit?: string,
 ): Promise<string | undefined> {
   if (explicit) return explicit;
+  if (!authCache) {
+    try {
+      authCache = await loadAuth();
+    } catch {
+      authCache = {};
+    }
+  }
+  const stored = authCache[providerName]?.apiKey;
+  if (stored) return stored;
   if (cfg.apiKey) {
     const raw = cfg.apiKey.trim();
     if (raw.startsWith("!")) {
@@ -286,7 +433,9 @@ export interface SelectionInput {
 /**
  * Union configured + live models across providers. Entries without
  * resolvable credentials are marked `authenticated: false` so the picker
- * can show-but-disable them (Pi's rule).
+ * can show-but-disable them (Pi's rule). A provider's whitelist (when
+ * non-empty) narrows the id set first, then its blacklist removes ids —
+ * applied to both configured and live ids.
  */
 export async function discoverModels(
   file: ModelsFile,
@@ -314,9 +463,12 @@ export async function discoverModels(
     } catch (error) {
       logger.warn("model_discovery_failed", { provider: name, error: String(error) });
     }
+    const configuredById = new Map(configured.map((m) => [m.id, m]));
     const seen = new Set<string>();
-    for (const m of configured) {
-      seen.add(m.id);
+    for (const id of applyModelFilters([...configuredById.keys()], cfg)) {
+      const m = configuredById.get(id);
+      if (!m) continue;
+      seen.add(id);
       out.push({
         provider: name,
         id: m.id,
@@ -325,10 +477,24 @@ export async function discoverModels(
         authenticated: key !== undefined || isLoopback(baseUrl),
       });
     }
-    for (const id of live) {
+    for (const id of applyModelFilters(live, cfg)) {
       if (seen.has(id)) continue;
       out.push({ provider: name, id, contextWindow: DEFAULT_CONTEXT_WINDOW, source: "live", authenticated: key !== undefined || isLoopback(baseUrl) });
     }
+  }
+  return out;
+}
+
+/** Whitelist narrows first, then blacklist removes. Empty whitelist = no narrowing. */
+function applyModelFilters(ids: string[], cfg: ProviderConfig): string[] {
+  let out = ids;
+  if (cfg.whitelist && cfg.whitelist.length > 0) {
+    const allow = new Set(cfg.whitelist);
+    out = out.filter((id) => allow.has(id));
+  }
+  if (cfg.blacklist && cfg.blacklist.length > 0) {
+    const deny = new Set(cfg.blacklist);
+    out = out.filter((id) => !deny.has(id));
   }
   return out;
 }

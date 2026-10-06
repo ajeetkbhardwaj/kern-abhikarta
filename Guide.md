@@ -32,7 +32,22 @@ Kern talks to any **OpenAI-compatible endpoint** — OpenAI, OpenRouter,
 NVIDIA, Ollama, LM Studio, llama.cpp, and most proxies. No
 provider-specific code.
 
-### Option A — config file (recommended)
+### Option A — `/connect` wizard (easiest, in the TUI)
+
+```
+/connect
+```
+
+Pick a preset (OpenAI, OpenRouter, NVIDIA, Ollama, LM Studio, llama.cpp)
+or enter a custom name + base URL, then choose how to authenticate (paste a
+key, `$ENV_VAR`, `!command`, or no key for local servers). Kern tests the
+endpoint live, lets you pick a model, and saves everything — then switches
+to it immediately. Esc cancels at any step with nothing written.
+
+Secrets go to `~/.kern/auth.json` (mode `0600`, never echoed back);
+non-secret config goes to `~/.kern/models.json`. Keep them that way.
+
+### Option B — config file (manual)
 
 Create `~/.kern/models.json`:
 
@@ -64,7 +79,7 @@ Notes:
 - A project can override with `<project>/.kern/models.json` (merged per
   provider, models merged by id).
 
-### Option B — environment variables / flags (CI, one-offs)
+### Option C — environment variables / flags (CI, one-offs)
 
 ```bash
 export KERN_PROVIDER=openai KERN_MODEL=gpt-4o KERN_API_KEY=sk-...
@@ -140,6 +155,7 @@ Type a task, or /help for commands.
 |---|---|
 | `/help` | This list + key hints |
 | `/model [filter]` | Searchable picker over all discovered models; switches mid-session (recorded in history) |
+| `/connect` | Add a provider: preset or custom URL, key, live test, save, switch |
 | `/compact [note]` | Summarize history into a checkpoint now |
 | `/diff` | Show working-tree changes (`git diff --stat` + status) |
 | `/new` | Start a fresh session |

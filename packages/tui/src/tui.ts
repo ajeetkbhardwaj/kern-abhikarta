@@ -13,7 +13,7 @@ import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
-import { createAdapterFor, discoverModels, type ModelsFile } from "@kern/model";
+import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
 import { theme } from "./theme.js";
 import { Screen } from "./screen.js";
 import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./components.js";
@@ -41,6 +41,7 @@ export interface InteractiveOptions {
 const COMMANDS = [
   { name: "help", description: "show this list" },
   { name: "model", description: "pick provider/model (auto-listed)" },
+  { name: "connect", description: "connect a provider (key or local URL)" },
   { name: "compact", description: "summarize history into a checkpoint" },
   { name: "diff", description: "show working-tree changes" },
   { name: "new", description: "start a fresh session" },
@@ -362,6 +363,57 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     });
   };
 
+  /** Single-choice SelectList in a titled Box. Resolves null on Esc. */
+  const pickOne = async (
+    title: string,
+    items: Array<{ value: string; label: string; description?: string; disabled?: boolean }>,
+  ): Promise<string | null> => {
+    const list = new SelectList<string>("", items, 10, defaultSelectListTheme);
+    const box = new Box(list, { title });
+    box.setInputTarget(list);
+    return await new Promise<string | null>((resolve) => {
+      list.onSelect = (item) => {
+        screen.hideOverlay();
+        screen.setFocus(editor);
+        resolve(item.value);
+      };
+      list.onCancel = () => {
+        screen.hideOverlay();
+        screen.setFocus(editor);
+        resolve(null);
+      };
+      screen.showOverlay(box);
+    });
+  };
+
+  /**
+   * Bordered text prompt. Enter resolves the typed text, Esc (on an empty
+   * buffer, via Editor onEscape — first Esc clears a non-empty buffer)
+   * resolves null. Typed secrets are never echoed back by the caller.
+   */
+  const promptText = async (title: string, initial?: string): Promise<string | null> => {
+    const ed = new Editor("› ");
+    if (initial) ed.setText(initial);
+    const body = new Container();
+    body.addChild(new Text(theme.muted("Enter submits · Esc cancels"), 0, 0));
+    body.addChild(ed);
+    const box = new Box(body, { title });
+    box.setInputTarget(ed);
+    return await new Promise<string | null>((resolve) => {
+      let done = false;
+      const finish = (value: string | null) => {
+        if (done) return;
+        done = true;
+        screen.hideOverlay();
+        screen.setFocus(editor);
+        resolve(value);
+      };
+      ed.onSubmit = (text) => finish(text);
+      ed.onEscape = () => finish(null);
+      screen.showOverlay(box);
+    });
+  };
+
   const pickModel = async (initialFilter?: string) => {
     if (busy) {
       info("Wait for the current turn to settle before switching models.");
@@ -383,15 +435,23 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return;
     }
     const current = session.modelInfo();
+    const lastUsed = await readLastUsed().catch(() => null);
+    const providers = options.modelsFile.providers ?? {};
     const list = new SelectList<string>(
       "model",
       [...models]
         .sort((a, b) => Number(b.authenticated) - Number(a.authenticated))
-        .map((m) => ({
-          value: `${m.provider}/${m.id}`,
-          label: `${m.provider}/${m.id}${m.provider === current.provider && m.id === current.modelId ? "  (current)" : ""}`,
-          description: `${m.source}${m.authenticated ? "" : " · no credentials"}`,
-        })),
+        .map((m) => {
+          const prov = providers[m.provider]?.displayName || m.provider;
+          const isCurrent = m.provider === current.provider && m.id === current.modelId;
+          const isLastUsed =
+            !isCurrent && lastUsed?.provider === m.provider && lastUsed?.model === m.id;
+          return {
+            value: `${m.provider}/${m.id}`,
+            label: `${prov}/${m.id}${isCurrent ? "  (current)" : isLastUsed ? "  (last used)" : ""}`,
+            description: `${m.source}${m.authenticated ? "" : " · no credentials"}`,
+          };
+        }),
       10,
       defaultSelectListTheme,
     );
@@ -409,11 +469,250 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           logger,
         );
         await session.setModel(adapter);
+        await recordLastUsed(provider, id).catch(() => undefined);
         ok(`Model: ${provider}/${id}`);
       } catch (error) {
         err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
+  };
+
+  /** `/connect` wizard: preset → key → test → model → save. Esc at any step cancels with nothing written. */
+  const runConnect = async (): Promise<void> => {
+    if (busy) {
+      info("Wait for the current turn to settle before connecting a provider.");
+      return;
+    }
+    // a. Preset picker.
+    const picked = await pickOne("connect — provider", [
+      ...PROVIDER_PRESETS.map((p) => ({
+        value: p.name,
+        label: p.name,
+        description: `${p.baseUrl} · ${p.hint}`,
+      })),
+      { value: "__custom__", label: "Custom…", description: "enter name + base URL manually" },
+    ]);
+    if (picked === null) {
+      info("Connect cancelled.");
+      return;
+    }
+    let name: string;
+    let baseUrl: string;
+    let presetEnv = "";
+    if (picked === "__custom__") {
+      // b. Custom name + URL.
+      const rawName = await promptText("provider name ([a-z0-9.-], Esc cancels)");
+      if (rawName === null) {
+        info("Connect cancelled.");
+        return;
+      }
+      const clean = rawName.trim().toLowerCase();
+      if (!/^[a-z0-9.-]{1,32}$/.test(clean)) {
+        err(`Bad provider name ${JSON.stringify(rawName)} — use [a-z0-9.-] (up to 32 chars).`);
+        return;
+      }
+      name = clean;
+      const rawUrl = await promptText("base URL", "http://localhost:11434/v1");
+      if (rawUrl === null) {
+        info("Connect cancelled.");
+        return;
+      }
+      baseUrl = rawUrl.trim();
+      if (!/^https?:\/\//i.test(baseUrl)) {
+        err(`Bad baseUrl ${JSON.stringify(rawUrl)} — must start with http:// or https://.`);
+        return;
+      }
+    } else {
+      const preset = PROVIDER_PRESETS.find((p) => p.name === picked);
+      if (!preset) {
+        err(`Unknown preset: ${picked}`);
+        return;
+      }
+      name = preset.name;
+      baseUrl = preset.baseUrl;
+      presetEnv = preset.apiKeyEnv;
+    }
+
+    // c. Key step. Resolves the stored key form: literal, `$VAR`, `!cmd`,
+    // or undefined for keyless local servers. Null = cancelled.
+    const askKey = async (): Promise<string | undefined | null> => {
+      const choice = await pickOne("connect — API key", [
+        { value: "enter", label: "Enter key", description: "paste the API key" },
+        {
+          value: "env",
+          label: presetEnv ? `Use $${presetEnv}` : "Use $ENV_VAR",
+          description: presetEnv ? `read from ${presetEnv} at runtime` : "read from an env var at runtime",
+        },
+        { value: "command", label: "Use !command", description: "run a shell command for the key" },
+        { value: "none", label: "No key (local)", description: "loopback servers need none" },
+      ]);
+      if (choice === null) return null;
+      if (choice === "none") return undefined;
+      if (choice === "enter") {
+        const typed = await promptText("API key (Enter submits; value is never echoed back)");
+        if (typed === null) return null;
+        const t = typed.trim();
+        if (!t) {
+          info("Empty key — continuing with no key.");
+          return undefined;
+        }
+        info("Key entered (not echoed).");
+        return t;
+      }
+      if (choice === "env") {
+        const typed = await promptText("env var ($NAME)", presetEnv ? `$${presetEnv}` : "$");
+        if (typed === null) return null;
+        const t = typed.trim();
+        if (!t) return undefined;
+        return t.startsWith("$") ? t : `$${t}`;
+      }
+      const typed = await promptText("credential command (!cmd)", "!");
+      if (typed === null) return null;
+      const t = typed.trim();
+      if (!t || t === "!") return undefined;
+      return t.startsWith("!") ? t : `!${t}`;
+    };
+    let apiKey = await askKey();
+    if (apiKey === null) {
+      info("Connect cancelled.");
+      return;
+    }
+
+    // d. Test loop.
+    let liveModels: string[] = [];
+    let manualId: string | null = null;
+    for (;;) {
+      info(`Testing ${baseUrl} …`);
+      let result: Awaited<ReturnType<typeof testProvider>>;
+      try {
+        result = await testProvider(baseUrl, apiKey, {});
+      } catch (error) {
+        result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+      }
+      if (result.ok) {
+        liveModels = result.models;
+        ok(`Connected: ${liveModels.length} model(s) found.`);
+        break;
+      }
+      err(`Test failed: ${result.message}`);
+      const fix = await pickOne("connect — test failed", [
+        { value: "url", label: "Edit URL", description: baseUrl },
+        { value: "key", label: "Edit key", description: "re-enter credential" },
+        { value: "manual", label: "Enter model id manually", description: "skip the live test" },
+        { value: "cancel", label: "Cancel", description: "write nothing (Esc)" },
+      ]);
+      if (fix === null || fix === "cancel") {
+        info("Connect cancelled.");
+        return;
+      }
+      if (fix === "url") {
+        const typed = await promptText("base URL", baseUrl);
+        if (typed === null) {
+          info("Connect cancelled.");
+          return;
+        }
+        baseUrl = typed.trim();
+        continue;
+      }
+      if (fix === "key") {
+        const k = await askKey();
+        if (k === null) {
+          info("Connect cancelled.");
+          return;
+        }
+        apiKey = k;
+        continue;
+      }
+      const typed = await promptText("model id");
+      if (typed === null || !typed.trim()) {
+        info("Connect cancelled.");
+        return;
+      }
+      manualId = typed.trim();
+      break;
+    }
+
+    // e. Model step.
+    let modelId = manualId;
+    if (!modelId) {
+      if (liveModels.length === 0) {
+        info("No models returned — enter one manually.");
+        const typed = await promptText("model id");
+        if (typed === null || !typed.trim()) {
+          info("Connect cancelled.");
+          return;
+        }
+        modelId = typed.trim();
+      } else {
+        const choice = await pickOne("connect — model", [
+          ...liveModels.map((m) => ({ value: m, label: m, description: "live" })),
+          { value: "__manual__", label: "Enter model id manually…", description: "" },
+        ]);
+        if (choice === null) {
+          info("Connect cancelled.");
+          return;
+        }
+        if (choice === "__manual__") {
+          const typed = await promptText("model id");
+          if (typed === null || !typed.trim()) {
+            info("Connect cancelled.");
+            return;
+          }
+          modelId = typed.trim();
+        } else {
+          modelId = choice;
+        }
+      }
+    }
+
+    const asDefault = await pickOne("set as default?", [
+      { value: "yes", label: "Yes", description: "use for new sessions" },
+      { value: "no", label: "No", description: "keep current default" },
+    ]);
+    if (asDefault === null) {
+      info("Connect cancelled.");
+      return;
+    }
+    // If the key is `$VAR`, also record apiKeyEnv so env-based resolution
+    // works even when the variable is unset at resolve time.
+    let apiKeyEnvOut: string | undefined = presetEnv || undefined;
+    const envMatch = apiKey?.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/);
+    if (envMatch?.[1]) apiKeyEnvOut = envMatch[1];
+    const cfg: ProviderConfig = {
+      baseUrl,
+      ...(apiKey ? { apiKey } : {}),
+      ...(apiKeyEnvOut ? { apiKeyEnv: apiKeyEnvOut } : {}),
+      models: [{ id: modelId }],
+    };
+    // saveProviderToUserFile moves a literal apiKey into auth.json itself;
+    // call saveAuthKey too for literal keys (idempotent), never for
+    // `$VAR` / `!cmd` references (those must stay resolvable, not stored).
+    try {
+      const saved = await saveProviderToUserFile(name, cfg, { makeDefault: asDefault === "yes" });
+      if (apiKey && !apiKey.startsWith("$") && !apiKey.startsWith("!")) {
+        await saveAuthKey(name, apiKey);
+      }
+      ok(`Saved ${saved.summary} → ${saved.path}`);
+    } catch (error) {
+      err(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    try {
+      options.modelsFile = await loadModelsFile(cwd);
+      const adapter: ModelAdapter = await createAdapterFor(
+        options.modelsFile,
+        name,
+        modelId,
+        { baseUrl, apiKey },
+        logger,
+      );
+      await session.setModel(adapter);
+      await recordLastUsed(name, modelId).catch(() => undefined);
+      ok(`Model: ${name}/${modelId}`);
+      printStatus();
+    } catch (error) {
+      err(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   const historySearch = async () => {
@@ -468,6 +767,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         return true;
       case "/model":
         await pickModel(arg || undefined);
+        return true;
+      case "/connect":
+        await runConnect();
         return true;
       case "/compact": {
         if (busy) {
