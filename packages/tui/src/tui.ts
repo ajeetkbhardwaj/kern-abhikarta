@@ -13,7 +13,7 @@ import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
-import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
+import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, resolveApiKey, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
 import { theme } from "./theme.js";
 import { Screen } from "./screen.js";
 import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./components.js";
@@ -41,6 +41,8 @@ export interface InteractiveOptions {
 const COMMANDS = [
   { name: "help", description: "show this list" },
   { name: "model", description: "pick provider/model (auto-listed)" },
+  { name: "models", description: "alias for /model" },
+  { name: "keys", description: "re-auth the current provider" },
   { name: "connect", description: "connect a provider (key or local URL)" },
   { name: "compact", description: "summarize history into a checkpoint" },
   { name: "diff", description: "show working-tree changes" },
@@ -74,11 +76,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   editor.setAutocompleteProvider(autocomplete);
   await autocomplete.refreshFiles();
 
-  screen.addChild(transcript);
-  screen.addChild(statusBar);
-  screen.addChild(editorBox);
-  screen.setFocus(editor);
-
   let busy = false;
   let abort: AbortController | null = null;
   let exiting = false;
@@ -89,6 +86,54 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let lastExitAttempt = 0;
   let stash = "";
   const recentPrompts: string[] = [];
+  let lastUserPrompt = "";
+  let authOverlayOpen = false;
+  /** Assigned after runCommand/runTurn exist; subscribe() may fire earlier. */
+  let handleAuthError: (message: string) => void = () => {};
+
+  // Toasts live one row above the queue panel: transient notices that
+  // auto-expire without disturbing the transcript. Errors stay persistent
+  // via err()/say() and never route here.
+  const toastLine = new Text("", 0, 0);
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  let toastToken = 0;
+  const toast = (text: string) => {
+    const token = ++toastToken;
+    toastLine.setText(theme.muted(`● ${text}`));
+    screen.requestRender();
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      if (token !== toastToken || exiting) return;
+      toastLine.setText("");
+      screen.requestRender();
+    }, 4000);
+  };
+
+  // Queue visibility: numbered list above the editor. Reads `queue` live;
+  // callers just mutate the array and request a render.
+  const queuePanel = {
+    render(_width: number): string[] {
+      if (queue.length === 0) return [];
+      const rows: string[] = [
+        theme.muted(`queued (${queue.length}/${MAX_QUEUE}) · Ctrl+Q clears · ⌫ on empty prompt removes last`),
+      ];
+      queue.forEach((q, i) => {
+        const oneLine = q.replace(/\s+/g, " ").trim();
+        const short = oneLine.length > 80 ? oneLine.slice(0, 80) + "…" : oneLine;
+        rows.push(theme.muted(`  ${i + 1}. ${short}`));
+      });
+      return rows;
+    },
+    invalidate(): void {},
+  };
+  const renderQueue = () => screen.requestRender();
+
+  screen.addChild(transcript);
+  screen.addChild(statusBar);
+  screen.addChild(toastLine);
+  screen.addChild(queuePanel);
+  screen.addChild(editorBox);
+  screen.setFocus(editor);
 
   const say = (text: string) => {
     transcript.addChild(new Text(text, 0, 0));
@@ -148,6 +193,17 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const closeAssistant = () => {
     md = null;
     mdText = "";
+  };
+
+  /** Persistent error card for auth failures; recovery choices follow via overlay. */
+  const showAuthCard = (message: string) => {
+    const body = new Text(
+      `${theme.error("Auth failed — the model rejected our credentials.")}\n${theme.muted(message)}\n${theme.muted("Pick a fix in the dialog above (Esc dismisses). /keys re-auths, /model switches.")}`,
+      0,
+      0,
+    );
+    transcript.addChild(new Box(body, { title: "auth error", border: theme.error }));
+    screen.requestRender();
   };
 
   const subscribe = () => {
@@ -216,19 +272,23 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         case "auto_compaction_start":
           activity = "compacting context";
           if (loader) loader.setMessage(activity);
-          info(`[compacting context (${event.phase})…]`);
+          toast(`compacting context (${event.phase})…`);
           break;
         case "auto_compaction_end":
-          info("[context compacted]");
+          toast("context compacted");
           break;
         case "auto_retry_start":
           activity = `retrying (${event.reason})`;
           if (loader) loader.setMessage(activity);
-          info(`[retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms]`);
+          toast(`retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms`);
           break;
         case "agent_error":
           closeAssistant();
           err(`[error ${event.error.code}] ${event.error.message}`);
+          if (event.error.code === "E_MODEL_AUTH") {
+            showAuthCard(event.error.message);
+            handleAuthError(event.error.message);
+          }
           break;
         case "agent_settled":
           closeAssistant();
@@ -240,15 +300,51 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
   subscribe();
 
+  // Small local list of destructive shell patterns. Matched against the
+  // approval prompt text; hits render the dialog in a danger style.
+  const DESTRUCTIVE_PATTERNS: RegExp[] = [
+    /\brm\s+.*-[a-z]*r[a-z]*f\b/i,
+    /\brm\s+-rf?\b/,
+    /\bgit\s+reset\s+--hard\b/,
+    /\bgit\s+clean\s+-[a-z]*f\b/,
+    /:\(\)\s*\{[^}]*\}\s*;/,
+    /\bmkfs\b/,
+    /\bdd\b.*\bof=\/dev\//,
+    />\s*\/dev\/[a-z]/,
+    /\b(shutdown|reboot|halt|poweroff)\b/i,
+    /\bDROP\s+(TABLE|DATABASE)\b/i,
+  ];
+
   // --- approval dialog ----------------------------------------------------------
   options.approvalHook.current = async (
     prompt: string,
     meta?: { toolName: string },
   ): Promise<boolean | "session"> => {
     const tool = meta?.toolName ?? "tool";
+    // The kernel contract carries only (prompt, { toolName }), so the full
+    // arguments arrive inside the prompt text — except when a caller passes
+    // them through at runtime, in which case we pretty-print them too.
+    const runtimeArgs = (meta as unknown as { arguments?: unknown } | undefined)?.arguments;
+    let argsDetail = "";
+    if (runtimeArgs !== undefined) {
+      try {
+        const pretty = JSON.stringify(runtimeArgs, null, 2);
+        argsDetail = pretty.length > 800 ? pretty.slice(0, 800) + "\n[…truncated…]" : pretty;
+      } catch {
+        argsDetail = String(runtimeArgs).slice(0, 800);
+      }
+    }
+    const danger = DESTRUCTIVE_PATTERNS.some((re) => re.test(prompt));
     const picked = await new Promise<string | null>((resolve) => {
       const body = new Container();
-      body.addChild(new Text(theme.warn(prompt), 0, 0));
+      body.addChild(new Text(danger ? theme.error(prompt) : theme.warn(prompt), 0, 0));
+      if (argsDetail) {
+        body.addChild(new Text(theme.muted("arguments:"), 0, 0));
+        body.addChild(new Text(theme.muted(argsDetail), 0, 0));
+      }
+      if (danger) {
+        body.addChild(new Text(theme.error("! destructive pattern detected — review carefully"), 0, 0));
+      }
       const list = new SelectList<string>(
         "",
         [
@@ -260,7 +356,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         defaultSelectListTheme,
       );
       body.addChild(list);
-      const box = new Box(body, { title: `approval: ${tool}` });
+      const box = new Box(body, {
+        title: danger ? `approval (DANGER): ${tool}` : `approval: ${tool}`,
+        ...(danger ? { border: theme.error } : {}),
+      });
       box.setInputTarget(list);
       list.onSelect = (item) => {
         screen.hideOverlay();
@@ -416,7 +515,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const pickModel = async (initialFilter?: string) => {
     if (busy) {
-      info("Wait for the current turn to settle before switching models.");
+      toast("Wait for the current turn to settle before switching models.");
       return;
     }
     let models;
@@ -480,7 +579,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   /** `/connect` wizard: preset → key → test → model → save. Esc at any step cancels with nothing written. */
   const runConnect = async (): Promise<void> => {
     if (busy) {
-      info("Wait for the current turn to settle before connecting a provider.");
+      toast("Wait for the current turn to settle before connecting a provider.");
       return;
     }
     // a. Preset picker.
@@ -493,7 +592,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       { value: "__custom__", label: "Custom…", description: "enter name + base URL manually" },
     ]);
     if (picked === null) {
-      info("Connect cancelled.");
+      toast("Connect cancelled.");
       return;
     }
     let name: string;
@@ -503,7 +602,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       // b. Custom name + URL.
       const rawName = await promptText("provider name ([a-z0-9.-], Esc cancels)");
       if (rawName === null) {
-        info("Connect cancelled.");
+        toast("Connect cancelled.");
         return;
       }
       const clean = rawName.trim().toLowerCase();
@@ -514,7 +613,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       name = clean;
       const rawUrl = await promptText("base URL", "http://localhost:11434/v1");
       if (rawUrl === null) {
-        info("Connect cancelled.");
+        toast("Connect cancelled.");
         return;
       }
       baseUrl = rawUrl.trim();
@@ -553,10 +652,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         if (typed === null) return null;
         const t = typed.trim();
         if (!t) {
-          info("Empty key — continuing with no key.");
+          toast("Empty key — continuing with no key.");
           return undefined;
         }
-        info("Key entered (not echoed).");
+        toast("Key entered (not echoed).");
         return t;
       }
       if (choice === "env") {
@@ -574,7 +673,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     };
     let apiKey = await askKey();
     if (apiKey === null) {
-      info("Connect cancelled.");
+      toast("Connect cancelled.");
       return;
     }
 
@@ -582,7 +681,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     let liveModels: string[] = [];
     let manualId: string | null = null;
     for (;;) {
-      info(`Testing ${baseUrl} …`);
+      toast(`Testing ${baseUrl} …`);
       let result: Awaited<ReturnType<typeof testProvider>>;
       try {
         result = await testProvider(baseUrl, apiKey, {});
@@ -602,13 +701,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         { value: "cancel", label: "Cancel", description: "write nothing (Esc)" },
       ]);
       if (fix === null || fix === "cancel") {
-        info("Connect cancelled.");
+        toast("Connect cancelled.");
         return;
       }
       if (fix === "url") {
         const typed = await promptText("base URL", baseUrl);
         if (typed === null) {
-          info("Connect cancelled.");
+          toast("Connect cancelled.");
           return;
         }
         baseUrl = typed.trim();
@@ -617,7 +716,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (fix === "key") {
         const k = await askKey();
         if (k === null) {
-          info("Connect cancelled.");
+          toast("Connect cancelled.");
           return;
         }
         apiKey = k;
@@ -625,7 +724,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
       const typed = await promptText("model id");
       if (typed === null || !typed.trim()) {
-        info("Connect cancelled.");
+        toast("Connect cancelled.");
         return;
       }
       manualId = typed.trim();
@@ -636,10 +735,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     let modelId = manualId;
     if (!modelId) {
       if (liveModels.length === 0) {
-        info("No models returned — enter one manually.");
+        toast("No models returned — enter one manually.");
         const typed = await promptText("model id");
         if (typed === null || !typed.trim()) {
-          info("Connect cancelled.");
+          toast("Connect cancelled.");
           return;
         }
         modelId = typed.trim();
@@ -649,13 +748,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           { value: "__manual__", label: "Enter model id manually…", description: "" },
         ]);
         if (choice === null) {
-          info("Connect cancelled.");
+          toast("Connect cancelled.");
           return;
         }
         if (choice === "__manual__") {
           const typed = await promptText("model id");
           if (typed === null || !typed.trim()) {
-            info("Connect cancelled.");
+            toast("Connect cancelled.");
             return;
           }
           modelId = typed.trim();
@@ -670,7 +769,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       { value: "no", label: "No", description: "keep current default" },
     ]);
     if (asDefault === null) {
-      info("Connect cancelled.");
+      toast("Connect cancelled.");
       return;
     }
     // If the key is `$VAR`, also record apiKeyEnv so env-based resolution
@@ -718,7 +817,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const historySearch = async () => {
     if (busy) return;
     if (recentPrompts.length === 0) {
-      info("No history yet.");
+      toast("No history yet.");
       return;
     }
     const list = new SelectList<string>(
@@ -732,17 +831,146 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const cycleMode = () => {
     if (busy) {
-      info("Mode changes apply when idle.");
+      toast("Mode changes apply when idle.");
       return;
     }
     const current = session.approvalMode();
     const next = current === "ask" ? "auto-allowlist" : "ask";
     if (session.setApprovalMode(next as "ask" | "auto-allowlist")) {
-      ok(`Approval mode: ${next === "ask" ? "manual (ask)" : "auto (no per-op prompts; destructive still asks)"}`);
+      toast(`Approval mode: ${next === "ask" ? "manual (ask)" : "auto (no per-op prompts; destructive still asks)"}`);
       printStatus();
     } else {
-      info("Approval mode is fixed by the active policy.");
+      toast("Approval mode is fixed by the active policy.");
     }
+  };
+
+  // --- empty-state suggestions ------------------------------------------------------
+  // First run with no session history: 2-3 suggestion chips. Selecting one
+  // fills the editor (never auto-sends). Up/Down+Enter via the overlay list,
+  // or the 1-3 number keys handled in the global input hook below.
+  const SUGGESTIONS = ["Summarize this repo", "Find TODOs", "Run tests"];
+  let suggestionBox: Box | null = null;
+  const showSuggestions = async (): Promise<void> => {
+    const list = new SelectList<string>(
+      "suggestions",
+      SUGGESTIONS.map((s, i) => ({ value: s, label: `${i + 1}. ${s}` })),
+      5,
+      defaultSelectListTheme,
+    );
+    const box = new Box(list, { title: "try — ↑↓+Enter or 1-3 fills the prompt (no send) · Esc dismisses" });
+    box.setInputTarget(list);
+    suggestionBox = box;
+    await new Promise<void>((resolve) => {
+      list.onSelect = (item) => {
+        screen.hideOverlay();
+        screen.setFocus(editor);
+        suggestionBox = null;
+        editor.setText(item.value);
+        toast(`Filled: ${item.value}`);
+        resolve();
+      };
+      list.onCancel = () => {
+        screen.hideOverlay();
+        screen.setFocus(editor);
+        suggestionBox = null;
+        resolve();
+      };
+      screen.showOverlay(box);
+    });
+  };
+
+  /** `/keys`: re-auth the CURRENT provider. Tests first; only a 401/403 offers re-entry. */
+  const runReauth = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before re-authenticating.");
+      return;
+    }
+    const current = session.modelInfo();
+    const cfg = (options.modelsFile.providers ?? {})[current.provider];
+    if (!cfg) {
+      err(`Unknown provider ${JSON.stringify(current.provider)} — use /connect to add it.`);
+      return;
+    }
+    toast(`Testing ${current.provider} (${cfg.baseUrl}) …`);
+    let key: string | undefined;
+    try {
+      key = await resolveApiKey(current.provider, cfg, options.apiKey);
+    } catch {
+      key = undefined;
+    }
+    let result: Awaited<ReturnType<typeof testProvider>>;
+    try {
+      result = await testProvider(cfg.baseUrl, key, {});
+    } catch (error) {
+      result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+    if (result.ok) {
+      toast(`Key OK for ${current.provider}: ${result.models.length} model(s) found.`);
+      return;
+    }
+    err(`Test failed: ${result.message}`);
+    if (!/401|403|rejected/i.test(result.message)) return;
+    const choice = await pickOne(`re-auth ${current.provider} — key rejected`, [
+      { value: "enter", label: "Re-enter key", description: "paste a new API key" },
+      { value: "env", label: "Use $ENV_VAR", description: "read from an env var at runtime" },
+      { value: "command", label: "Use !command", description: "run a shell command for the key" },
+      { value: "cancel", label: "Cancel", description: "keep the current key (Esc)" },
+    ]);
+    if (choice === null || choice === "cancel") {
+      toast("Re-auth cancelled.");
+      return;
+    }
+    let nextKey: string | undefined;
+    if (choice === "enter") {
+      const typed = await promptText("API key (Enter submits; value is never echoed back)");
+      if (typed === null || !typed.trim()) {
+        toast("Re-auth cancelled.");
+        return;
+      }
+      nextKey = typed.trim();
+    } else if (choice === "env") {
+      const typed = await promptText("env var ($NAME)", `$${cfg.apiKeyEnv ?? ""}`);
+      if (typed === null || !typed.trim()) {
+        toast("Re-auth cancelled.");
+        return;
+      }
+      const t = typed.trim();
+      nextKey = t.startsWith("$") ? t : `$${t}`;
+    } else {
+      const typed = await promptText("credential command (!cmd)", "!");
+      if (typed === null || !typed.trim() || typed.trim() === "!") {
+        toast("Re-auth cancelled.");
+        return;
+      }
+      const t = typed.trim();
+      nextKey = t.startsWith("!") ? t : `!${t}`;
+    }
+    try {
+      if (nextKey && !nextKey.startsWith("$") && !nextKey.startsWith("!")) {
+        await saveAuthKey(current.provider, nextKey);
+      } else {
+        const merged: ProviderConfig = { ...cfg, apiKey: nextKey };
+        await saveProviderToUserFile(current.provider, merged, {});
+        options.modelsFile = await loadModelsFile(cwd);
+      }
+      toast("Key saved — retesting …");
+    } catch (error) {
+      err(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    let retest: Awaited<ReturnType<typeof testProvider>>;
+    try {
+      const resolved = await resolveApiKey(
+        current.provider,
+        (options.modelsFile.providers ?? {})[current.provider] ?? cfg,
+        nextKey,
+      );
+      retest = await testProvider(cfg.baseUrl, resolved, {});
+    } catch (error) {
+      retest = { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+    if (retest.ok) toast(`Re-authenticated ${current.provider}: ${retest.models.length} model(s) found.`);
+    else err(`Retest failed: ${retest.message}`);
   };
 
   // --- slash commands -------------------------------------------------------------------
@@ -766,19 +994,23 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         printStatus();
         return true;
       case "/model":
+      case "/models":
         await pickModel(arg || undefined);
+        return true;
+      case "/keys":
+        await runReauth();
         return true;
       case "/connect":
         await runConnect();
         return true;
       case "/compact": {
         if (busy) {
-          info("A turn is running — compaction will happen automatically if needed.");
+          toast("A turn is running — compaction will happen automatically if needed.");
           return true;
         }
         try {
           const result = await session.compact(arg || undefined);
-          if (!result) info("Nothing to compact yet.");
+          if (!result) toast("Nothing to compact yet.");
           else ok(`Compacted through ${result.replacesThroughId}.`);
         } catch (error) {
           err(`Compaction failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -799,7 +1031,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
       case "/new": {
         if (busy) {
-          info("Wait for the current turn to settle before starting a new session.");
+          toast("Wait for the current turn to settle before starting a new session.");
           return true;
         }
         try {
@@ -808,12 +1040,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           session = fresh.session;
           manager = fresh.manager;
           queue = [];
+          renderQueue();
           subscribe();
           await autocomplete.refreshFiles();
           transcript.clear();
           printHeader();
           printStatus();
-          info(`New session started.`);
+          toast("New session started.");
         } catch (error) {
           err(`New session failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -821,7 +1054,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
       case "/export": {
         if (busy) {
-          info("Wait for the current turn to settle before exporting.");
+          toast("Wait for the current turn to settle before exporting.");
           return true;
         }
         try {
@@ -858,6 +1091,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     busy = true;
     abort = new AbortController();
     activity = "thinking";
+    lastUserPrompt = text;
     setBusy(true);
     say(theme.bold("you"));
     say(theme.muted(text));
@@ -874,8 +1108,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           printStatus();
           void autocomplete.refreshFiles();
           const next = queue.shift();
+          renderQueue();
           if (next !== undefined) {
-            info(`[sending queued message${queue.length > 0 ? ` (+${queue.length} more)` : ""}]`);
+            toast(`sending queued message${queue.length > 0 ? ` (+${queue.length} more)` : ""}`);
             runTurn(next);
           }
         }
@@ -901,10 +1136,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (busy) {
       const text = line.trim();
       if (text) {
-        if (queue.length >= MAX_QUEUE) info(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`);
+        if (queue.length >= MAX_QUEUE) toast(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`);
         else {
           queue.push(line);
-          info(`[queued ${queue.length}]`);
+          renderQueue();
+          toast(`queued ${queue.length}/${MAX_QUEUE}`);
         }
       }
       return;
@@ -957,6 +1193,49 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     })();
   };
 
+  // Auth-failure recovery (wired to the agent_error handler above). Offers
+  // immediate actions; Retry re-submits the last user prompt, /connect and
+  // /model reuse the existing runCommand paths.
+  handleAuthError = (_message: string) => {
+    if (authOverlayOpen) return;
+    authOverlayOpen = true;
+    void (async () => {
+      const pick = await pickOne("auth error — how to recover?", [
+        { value: "connect", label: "Reconnect with /connect", description: "run the connect wizard" },
+        {
+          value: "retry",
+          label: "Retry turn",
+          description: lastUserPrompt ? "re-submit the last prompt" : "no prompt to retry yet",
+          disabled: !lastUserPrompt,
+        },
+        { value: "model", label: "Switch model (/model)", description: "pick another provider/model" },
+        { value: "dismiss", label: "Dismiss", description: "stay here (Esc)" },
+      ]);
+      authOverlayOpen = false;
+      if (pick === "connect") await runCommand("/connect");
+      else if (pick === "model") await runCommand("/model");
+      else if (pick === "retry") {
+        if (!lastUserPrompt) {
+          toast("Nothing to retry yet.");
+          return;
+        }
+        if (busy) {
+          if (queue.length >= MAX_QUEUE) toast(`Queue full (${MAX_QUEUE}) — retry dropped.`);
+          else {
+            queue.unshift(lastUserPrompt);
+            renderQueue();
+            toast("Retry queued — sends when the turn settles.");
+          }
+          return;
+        }
+        toast("Retrying last prompt…");
+        runTurn(lastUserPrompt);
+      } else {
+        toast("Auth error dismissed — /connect, /model, or retry when ready.");
+      }
+    })();
+  };
+
   editor.onSubmit = submit;
 
   const exit = () => {
@@ -978,12 +1257,28 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return;
     }
     lastExitAttempt = now;
-    info("Press Ctrl+D again to exit.");
+    toast("Press Ctrl+D again to exit.");
   };
 
   // --- global keys ----------------------------------------------------------------------------
   screen.setInputHook((key) => {
-    if (screen.hasOverlay()) return undefined; // overlays own Esc/arrows/Enter
+    if (screen.hasOverlay()) {
+      // Number-key quick fill for the empty-state suggestions overlay.
+      if (suggestionBox && screen.overlayTop() === suggestionBox) {
+        for (let n = 0; n < SUGGESTIONS.length; n++) {
+          if (matchesKey(key, { char: String(n + 1) })) {
+            const value = SUGGESTIONS[n] ?? "";
+            screen.hideOverlay();
+            screen.setFocus(editor);
+            suggestionBox = null;
+            editor.setText(value);
+            toast(`Filled: ${value}`);
+            return { consume: true };
+          }
+        }
+      }
+      return undefined; // overlays own Esc/arrows/Enter
+    }
     if (matchesKey(key, "ctrl+c")) {
       if (busy) {
         abort?.abort();
@@ -996,6 +1291,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (matchesKey(key, "ctrl+d")) {
       if (editor.getText().length === 0) requestExit();
       return editor.getText().length === 0 ? { consume: true } : undefined;
+    }
+    if (matchesKey(key, "ctrl+q")) {
+      if (queue.length > 0) {
+        queue = [];
+        renderQueue();
+        toast("Queue cleared.");
+      }
+      return { consume: true };
+    }
+    // Backspace on an empty editor removes the last queued item.
+    if (matchesKey(key, "backspace") && editor.getText().length === 0 && queue.length > 0) {
+      const removed = queue.pop();
+      renderQueue();
+      toast(`Removed queued message${removed ? `: ${removed.replace(/\s+/g, " ").trim().slice(0, 60)}` : ""}`);
+      return { consume: true };
     }
     if (matchesKey(key, "ctrl+s")) {
       editor.stashPrompt();
@@ -1020,6 +1330,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   printHeader();
   printStatus();
   screen.start();
+  if (manager.getActiveMessages().length === 0) {
+    info("No history yet — pick a suggestion (↑↓+Enter or 1-3 fills the prompt, never sends) or type your own.");
+    await showSuggestions();
+  }
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (exiting) {
