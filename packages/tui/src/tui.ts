@@ -86,17 +86,17 @@ void highlightCode;
  */
 class OverlayDialog implements Component {
   constructor(
-    private readonly box: Box,
+    private readonly root: Component,
     private readonly target: Component,
   ) {}
   render(width: number): string[] {
-    return this.box.render(width);
+    return this.root.render(width);
   }
   handleInput(data: string): void {
     this.target.handleInput?.(data);
   }
   invalidate(): void {
-    this.box.invalidate();
+    this.root.invalidate();
   }
 }
 
@@ -115,7 +115,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const transcript = new Container();
   const statusBar = new StatusBar();
   const editor = new Editor(tui, buildEditorTheme(), { autocompleteMaxVisible: 8 });
-  const editorBox = new Box(editor, { title: "prompt" });
   const autocomplete = buildAutocomplete(COMMANDS, cwd);
   editor.setAutocompleteProvider(autocomplete);
 
@@ -181,7 +180,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   tui.addChild(statusBar);
   tui.addChild(toastLine);
   tui.addChild(queuePanel);
-  tui.addChild(editorBox);
+  tui.addChild(editor);
   tui.setFocus(editor);
 
   const say = (text: string) => {
@@ -360,9 +359,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   ];
 
   /** Wrap content + interactive child in a centered overlay; keys forward to the child. */
-  const showDialog = (content: Component, target: Component): OverlayHandle => {
-    const box = new Box(content, {});
-    return tui.showOverlay(new OverlayDialog(box, target), OVERLAY_OPTS);
+  const showDialog = (content: Component, target: Component, framed = true): OverlayHandle => {
+    const root = framed ? new Box(content, {}) : content;
+    return tui.showOverlay(new OverlayDialog(root, target), OVERLAY_OPTS);
   };
 
   /** Titled single-choice SelectList in a centered overlay. Resolves null on Esc. */
@@ -563,7 +562,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     body.addChild(new Text(theme.bold(title), 0, 0));
     body.addChild(new Text(theme.muted("Enter submits · Esc cancels"), 0, 0));
     body.addChild(ed);
-    const handle = showDialog(body, ed);
+    const handle = showDialog(body, ed, false);
     return await new Promise<string | null>((resolve) => {
       let done = false;
       const finish = (value: string | null) => {
