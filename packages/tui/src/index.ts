@@ -1,14 +1,11 @@
 /**
- * @kern/tui — terminal UI built from first principles.
+ * @kern/tui — terminal UI on @earendil-works/pi-tui (MIT).
  *
- * Own component framework (differential main-screen renderer, synchronized
- * output, multiline editor, markdown, select lists, loader) plus the Kern
- * interactive orchestrator. Architectural patterns follow standard practice
- * for this class of UI (cf. @earendil-works/pi-tui, MIT — ideas studied,
- * code written fresh); all application logic is Kern's own.
+ * Renderer, editor, and picker primitives come from pi-tui; Kern owns the
+ * interactive orchestrator (commands, /connect wizard, approvals, toasts,
+ * queue, status bar) plus custom components (Box, StatusBar, ToolCard).
  */
 export * from "./theme.js";
-export * from "./terminal.js";
 export * from "./keys.js";
 export * from "./text.js";
 export * from "./component.js";

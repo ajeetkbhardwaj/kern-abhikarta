@@ -68,5 +68,3 @@ export function keepInverse(inner: string): string {
   if (noColor()) return inner;
   return `${ESC}7m${inner.split(RESET).join(`${RESET}${ESC}7m`)}${RESET}`;
 }
-
-export const CLEAR_SCREEN = `${ESC}2J${ESC}H`;

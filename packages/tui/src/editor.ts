@@ -44,33 +44,6 @@ import { theme } from "./theme.js";
 import { splitKeys } from "./text.js";
 import { matchesKey } from "./keys.js";
 
-/**
- * Legacy completion shape from the hand-rolled editor, kept so existing
- * imports keep compiling. pi-tui uses `AutocompleteItem` instead; new code
- * should prefer that.
- */
-export interface Completion {
-  /** Text to insert for the token at the cursor. */
-  insert: string;
-  /** Full replacement rows for dropdown-style completion, or null. */
-  dropdown: string[] | null;
-}
-
-/**
- * Legacy dropdown-row shape, kept so existing imports keep compiling.
- * pi-tui uses `AutocompleteItem` (`value`/`label`/`description`) instead.
- */
-export interface DropdownItem {
-  /** Suffix to insert at the cursor for the active token. */
-  insert: string;
-  /** Display text for the row. */
-  display: string;
-  /** Optional right-hand hint (e.g. command description). */
-  description?: string;
-  /** Token kind, for ranking/styling. */
-  kind?: "command" | "file";
-}
-
 /** Autocomplete provider contract — now exactly pi-tui's. */
 export type AutocompleteProvider = PiAutocompleteProvider;
 

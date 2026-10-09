@@ -64,20 +64,6 @@ export class Spacer implements Component {
   invalidate(): void {}
 }
 
-export class TruncatedText implements Component {
-  constructor(private text: string) {}
-
-  setText(text: string): void {
-    this.text = text;
-  }
-
-  render(width: number): string[] {
-    return [truncateToWidth(this.text, width, "")];
-  }
-
-  invalidate(): void {}
-}
-
 /** Horizontal divider rule. */
 export class Rule implements Component {
   constructor(private readonly char = "─") {}

@@ -8,7 +8,7 @@
  */
 
 import { writeFile, readFile, stat } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentEvent, Logger, ModelAdapter } from "@kern/protocol";
 import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
@@ -17,7 +17,7 @@ import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordL
 import { theme } from "./theme.js";
 import { Screen } from "./screen.js";
 import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./components.js";
-import { Editor, defaultEditorTheme } from "./editor.js";
+import { Editor } from "./editor.js";
 import { SelectList, Loader, defaultSelectListTheme } from "./select-list.js";
 import { Markdown, defaultMarkdownTheme } from "./markdown.js";
 import { buildAutocomplete } from "./autocomplete.js";

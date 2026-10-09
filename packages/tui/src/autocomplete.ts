@@ -17,11 +17,6 @@ import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 
 export { CombinedAutocompleteProvider };
 
-export interface CommandDef {
-  name: string;
-  description: string;
-}
-
 /**
  * Build the pi-tui autocomplete provider for the prompt editor.
  *
