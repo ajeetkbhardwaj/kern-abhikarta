@@ -1,10 +1,22 @@
 /**
- * @kern/tui — interactive orchestrator on our own component framework.
+ * @kern/tui — interactive orchestrator on @earendil-works/pi-tui.
  *
  * Main-screen renderer (native scrollback), transcript Container, streaming
  * Markdown with syntax highlighting, Editor with slash/file completion,
  * SelectList overlays for approvals / model picker / history, Loader
  * spinner while busy. Observes `AgentEvent`s; acts only via `AgentSession`.
+ *
+ * pi-tui adaptation notes:
+ * - Overlays are shown with `showOverlay(c, {anchor:"center", width:"80%",
+ *   maxHeight:"80%"})`, which returns a handle with `.hide()`.
+ * - SelectList takes no title and no disabled items: titles render as a
+ *   `Text` header above the list, and unavailable options get a suffix with
+ *   their selection ignored.
+ * - Editor has no onEscape: prompt dialogs emulate Esc-cancel via the
+ *   input listener, which runs BEFORE focused components (a handled Esc
+ *   returns `{consume:true}` to preempt the dialog's editor).
+ * - Input keys reach the focused component; overlay roots are wrapped in a
+ *   local `OverlayDialog` that forwards keys to the interactive child.
  */
 
 import { writeFile, readFile, stat } from "node:fs/promises";
@@ -14,14 +26,20 @@ import { nullLogger } from "@kern/protocol";
 import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
 import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, resolveApiKey, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
-import { theme } from "./theme.js";
-import { Screen } from "./screen.js";
-import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./components.js";
-import { Editor } from "./editor.js";
-import { SelectList, Loader, defaultSelectListTheme } from "./select-list.js";
-import { Markdown, defaultMarkdownTheme } from "./markdown.js";
+import {
+  TuiMainScreen,
+  ProcessTerminal,
+  Editor,
+  SelectList,
+  Markdown,
+  Loader,
+  matchesKey,
+  type Component,
+  type OverlayHandle,
+} from "@earendil-works/pi-tui";
+import { theme, statusBg, buildMarkdownTheme, buildSelectTheme, buildEditorTheme, highlightCode } from "./theme.js";
+import { Box, StatusBar, ToolCard, Rule, Container, Text, Spacer } from "./components.js";
 import { buildAutocomplete } from "./autocomplete.js";
-import { matchesKey } from "./keys.js";
 
 export interface InteractiveOptions {
   session: AgentSession;
@@ -58,6 +76,32 @@ const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
 
+void statusBg;
+void highlightCode;
+
+/**
+ * Overlay root: renders a teammate-owned Box, forwards keys to the
+ * interactive child. pi-tui focuses the overlay root component, so without
+ * this wrapper keys would never reach a SelectList/Editor nested inside.
+ */
+class OverlayDialog implements Component {
+  constructor(
+    private readonly box: Box,
+    private readonly target: Component,
+  ) {}
+  render(width: number): string[] {
+    return this.box.render(width);
+  }
+  handleInput(data: string): void {
+    this.target.handleInput?.(data);
+  }
+  invalidate(): void {
+    this.box.invalidate();
+  }
+}
+
+const OVERLAY_OPTS = { anchor: "center" as const, width: "80%" as const, maxHeight: "80%" as const };
+
 export async function runInteractive(options: InteractiveOptions): Promise<void> {
   const logger = options.logger ?? nullLogger;
   let session = options.session;
@@ -67,10 +111,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   }
   const cwd = resolve(options.cwd);
 
-  const screen = new Screen();
+  const tui = new TuiMainScreen(new ProcessTerminal());
   const transcript = new Container();
   const statusBar = new StatusBar();
-  const editor = new Editor(screen.tui, "› ");
+  const editor = new Editor(tui, buildEditorTheme(), { autocompleteMaxVisible: 8 });
   const editorBox = new Box(editor, { title: "prompt" });
   const autocomplete = buildAutocomplete(COMMANDS, cwd);
   editor.setAutocompleteProvider(autocomplete);
@@ -89,6 +133,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let authOverlayOpen = false;
   /** Assigned after runCommand/runTurn exist; subscribe() may fire earlier. */
   let handleAuthError: (message: string) => void = () => {};
+  /** Open text-prompt dialog (Esc cancels via the input listener). */
+  let promptDialog: { cancel: () => void } | null = null;
+  /** Empty-state suggestion overlay state (digits 1-3 fill, never send). */
+  let suggestionsOpen = false;
+  let suggestionPick: ((value: string) => void) | null = null;
+  const SUGGESTION_DIGITS = ["1", "2", "3"] as const;
 
   // Toasts live one row above the queue panel: transient notices that
   // auto-expire without disturbing the transcript. Errors stay persistent
@@ -99,18 +149,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const toast = (text: string) => {
     const token = ++toastToken;
     toastLine.setText(theme.muted(`● ${text}`));
-    screen.requestRender();
+    tui.requestRender();
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {
       if (token !== toastToken || exiting) return;
       toastLine.setText("");
-      screen.requestRender();
+      tui.requestRender();
     }, 4000);
   };
 
   // Queue visibility: numbered list above the editor. Reads `queue` live;
   // callers just mutate the array and request a render.
-  const queuePanel = {
+  const queuePanel: Component = {
     render(_width: number): string[] {
       if (queue.length === 0) return [];
       const rows: string[] = [
@@ -125,18 +175,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     },
     invalidate(): void {},
   };
-  const renderQueue = () => screen.requestRender();
+  const renderQueue = () => tui.requestRender();
 
-  screen.addChild(transcript);
-  screen.addChild(statusBar);
-  screen.addChild(toastLine);
-  screen.addChild(queuePanel);
-  screen.addChild(editorBox);
-  screen.setFocus(editor);
+  tui.addChild(transcript);
+  tui.addChild(statusBar);
+  tui.addChild(toastLine);
+  tui.addChild(queuePanel);
+  tui.addChild(editorBox);
+  tui.setFocus(editor);
 
   const say = (text: string) => {
     transcript.addChild(new Text(text, 0, 0));
-    screen.requestRender();
+    tui.requestRender();
   };
   const info = (text: string) => say(theme.muted(text));
   const err = (text: string) => say(theme.error(text));
@@ -145,7 +195,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const setBusy = (running: boolean) => {
     busy = running;
     if (running) {
-      loader = new Loader(() => screen.requestRender(), activity);
+      loader = new Loader(tui, theme.accent, theme.muted, activity);
       transcript.addChild(loader);
       loader.start();
     } else if (loader) {
@@ -153,7 +203,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       transcript.removeChild(loader);
       loader = null;
     }
-    screen.requestRender();
+    tui.requestRender();
   };
 
   const modeLabel = () => (session.approvalMode() === "ask" ? "manual" : session.approvalMode());
@@ -168,7 +218,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     info("Type a task, or /help for commands.");
     info(HINTS);
     transcript.addChild(new Rule());
-    screen.requestRender();
+    tui.requestRender();
   };
 
   const printStatus = () => {
@@ -182,7 +232,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       ctx,
       `${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s`,
     ]);
-    screen.requestRender();
+    tui.requestRender();
   };
 
   // --- event → transcript -----------------------------------------------------
@@ -201,8 +251,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       0,
       0,
     );
-    transcript.addChild(new Box(body, { title: "auth error", border: theme.error }));
-    screen.requestRender();
+    transcript.addChild(new Box(body, { title: "auth error", mood: "error" }));
+    tui.requestRender();
   };
 
   const subscribe = () => {
@@ -214,12 +264,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           if (!md) {
             say(theme.bold("assistant"));
             mdText = "";
-            md = new Markdown("", defaultMarkdownTheme);
+            md = new Markdown("", 0, 0, buildMarkdownTheme());
             transcript.addChild(md);
           }
           mdText += event.delta;
           md.setText(mdText);
-          screen.requestRender();
+          tui.requestRender();
           break;
         case "reasoning_delta":
           activity = "thinking";
@@ -228,7 +278,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         case "message_end":
           closeAssistant();
           transcript.addChild(new Spacer(1));
-          screen.requestRender();
+          tui.requestRender();
           break;
         case "tool_execution_start": {
           closeAssistant();
@@ -237,7 +287,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
           cards.set(event.toolCallId, card);
           transcript.addChild(new Box(card, {}));
-          screen.requestRender();
+          tui.requestRender();
           break;
         }
         case "tool_execution_end": {
@@ -246,18 +296,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           const output = event.result
             ? event.result.content.map((c) => c.text).join("\n")
             : "";
-          const detail = event.result?.details;
-          const extra =
-            detail && typeof detail === "object" && "durationMs" in detail
-              ? `${((detail.durationMs as number) / 1000).toFixed(1)}s`
-              : "";
           if (card) {
             if (output) card.appendOutput(output);
-            card.finish(event.isError, extra);
+            card.finish(event.isError);
           } else {
             say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
           }
-          screen.requestRender();
+          tui.requestRender();
           break;
         }
         case "tool_execution_update": {
@@ -265,7 +310,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           if (loader) loader.setMessage(activity);
           const card = cards.get(event.toolCallId);
           if (card && typeof event.delta === "string") card.appendOutput(event.delta);
-          screen.requestRender();
+          tui.requestRender();
           break;
         }
         case "auto_compaction_start":
@@ -314,6 +359,51 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     /\bDROP\s+(TABLE|DATABASE)\b/i,
   ];
 
+  /** Wrap content + interactive child in a centered overlay; keys forward to the child. */
+  const showDialog = (content: Component, target: Component): OverlayHandle => {
+    const box = new Box(content, {});
+    return tui.showOverlay(new OverlayDialog(box, target), OVERLAY_OPTS);
+  };
+
+  /** Titled single-choice SelectList in a centered overlay. Resolves null on Esc. */
+  const pickOne = async (
+    title: string,
+    items: Array<{ value: string; label: string; description?: string; disabled?: boolean }>,
+  ): Promise<string | null> => {
+    const disabled = new Set(items.filter((i) => i.disabled).map((i) => i.value));
+    const list = new SelectList(
+      items.map((i) => ({
+        value: i.value,
+        label: i.disabled ? `${i.label} (unavailable)` : i.label,
+        description: i.description,
+      })),
+      10,
+      buildSelectTheme(),
+    );
+    const body = new Container();
+    body.addChild(new Text(theme.bold(title), 0, 0));
+    body.addChild(list);
+    const handle = showDialog(body, list);
+    return await new Promise<string | null>((resolve) => {
+      let done = false;
+      const finish = (value: string | null) => {
+        if (done) return;
+        done = true;
+        handle.hide();
+        tui.setFocus(editor);
+        resolve(value);
+      };
+      list.onSelect = (item) => {
+        if (disabled.has(item.value)) {
+          toast("That option is unavailable.");
+          return;
+        }
+        finish(item.value);
+      };
+      list.onCancel = () => finish(null);
+    });
+  };
+
   // --- approval dialog ----------------------------------------------------------
   options.approvalHook.current = async (
     prompt: string,
@@ -344,33 +434,31 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (danger) {
         body.addChild(new Text(theme.error("! destructive pattern detected — review carefully"), 0, 0));
       }
-      const list = new SelectList<string>(
-        "",
+      const list = new SelectList(
         [
           { value: "once", label: "Yes, run once", description: "allow just this call" },
           { value: "session", label: `Yes, always allow ${tool}`, description: "no more prompts this session" },
           { value: "no", label: "No", description: "deny (Esc)" },
         ],
         5,
-        defaultSelectListTheme,
+        buildSelectTheme(),
       );
       body.addChild(list);
       const box = new Box(body, {
         title: danger ? `approval (DANGER): ${tool}` : `approval: ${tool}`,
-        ...(danger ? { border: theme.error } : {}),
+        mood: danger ? "error" : "default",
       });
-      box.setInputTarget(list);
-      list.onSelect = (item) => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        resolve(item.value);
+      const handle = tui.showOverlay(new OverlayDialog(box, list), OVERLAY_OPTS);
+      let done = false;
+      const finish = (value: string | null) => {
+        if (done) return;
+        done = true;
+        handle.hide();
+        tui.setFocus(editor);
+        resolve(value);
       };
-      list.onCancel = () => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        resolve(null);
-      };
-      screen.showOverlay(box);
+      list.onSelect = (item) => finish(item.value);
+      list.onCancel = () => finish(null);
     });
     if (picked === "session") {
       ok(`Always allowing ${tool} for this session.`);
@@ -441,74 +529,53 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // --- overlays: model picker, history -------------------------------------------------
   const withOverlay = async (
     title: string,
-    list: SelectList<string>,
+    list: SelectList,
     onPick: (value: string) => Promise<void> | void,
   ): Promise<void> => {
-    const box = new Box(list, { title });
-    box.setInputTarget(list);
+    const body = new Container();
+    body.addChild(new Text(theme.bold(title), 0, 0));
+    body.addChild(list);
+    const handle = showDialog(body, list);
     await new Promise<void>((resolve) => {
-      list.onSelect = (item) => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        void Promise.resolve(onPick(item.value)).finally(() => resolve());
+      let done = false;
+      const finish = (run: (() => Promise<void> | void) | null) => {
+        if (done) return;
+        done = true;
+        handle.hide();
+        tui.setFocus(editor);
+        void Promise.resolve(run?.()).finally(() => resolve());
       };
-      list.onCancel = () => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        resolve();
-      };
-      screen.showOverlay(box);
-    });
-  };
-
-  /** Single-choice SelectList in a titled Box. Resolves null on Esc. */
-  const pickOne = async (
-    title: string,
-    items: Array<{ value: string; label: string; description?: string; disabled?: boolean }>,
-  ): Promise<string | null> => {
-    const list = new SelectList<string>("", items, 10, defaultSelectListTheme);
-    const box = new Box(list, { title });
-    box.setInputTarget(list);
-    return await new Promise<string | null>((resolve) => {
-      list.onSelect = (item) => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        resolve(item.value);
-      };
-      list.onCancel = () => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        resolve(null);
-      };
-      screen.showOverlay(box);
+      list.onSelect = (item) => finish(() => onPick(item.value));
+      list.onCancel = () => finish(null);
     });
   };
 
   /**
-   * Bordered text prompt. Enter resolves the typed text, Esc (on an empty
-   * buffer, via Editor onEscape — first Esc clears a non-empty buffer)
-   * resolves null. Typed secrets are never echoed back by the caller.
+   * Bordered text prompt. Enter resolves the typed text; Esc resolves null
+   * via the global input listener (pi-tui's Editor has no onEscape — the
+   * listener runs first and consumes the key). Typed secrets are never
+   * echoed back by the caller.
    */
   const promptText = async (title: string, initial?: string): Promise<string | null> => {
-    const ed = new Editor(screen.tui, "› ");
+    const ed = new Editor(tui, buildEditorTheme());
     if (initial) ed.setText(initial);
     const body = new Container();
+    body.addChild(new Text(theme.bold(title), 0, 0));
     body.addChild(new Text(theme.muted("Enter submits · Esc cancels"), 0, 0));
     body.addChild(ed);
-    const box = new Box(body, { title });
-    box.setInputTarget(ed);
+    const handle = showDialog(body, ed);
     return await new Promise<string | null>((resolve) => {
       let done = false;
       const finish = (value: string | null) => {
         if (done) return;
         done = true;
-        screen.hideOverlay();
-        screen.setFocus(editor);
+        promptDialog = null;
+        handle.hide();
+        tui.setFocus(editor);
         resolve(value);
       };
+      promptDialog = { cancel: () => finish(null) };
       ed.onSubmit = (text) => finish(text);
-      ed.onEscape = () => finish(null);
-      screen.showOverlay(box);
     });
   };
 
@@ -535,8 +602,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const current = session.modelInfo();
     const lastUsed = await readLastUsed().catch(() => null);
     const providers = options.modelsFile.providers ?? {};
-    const list = new SelectList<string>(
-      "model",
+    const list = new SelectList(
       [...models]
         .sort((a, b) => Number(b.authenticated) - Number(a.authenticated))
         .map((m) => {
@@ -551,7 +617,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           };
         }),
       10,
-      defaultSelectListTheme,
+      buildSelectTheme(),
     );
     if (initialFilter) list.setFilter(initialFilter);
     await withOverlay("model", list, async (value) => {
@@ -819,11 +885,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       toast("No history yet.");
       return;
     }
-    const list = new SelectList<string>(
-      "history",
+    const list = new SelectList(
       [...recentPrompts].reverse().map((h) => ({ value: h, label: h.length > 100 ? h.slice(0, 100) + "…" : h })),
       10,
-      defaultSelectListTheme,
+      buildSelectTheme(),
     );
     await withOverlay("history", list, (value) => editor.setText(value));
   };
@@ -848,33 +913,35 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // fills the editor (never auto-sends). Up/Down+Enter via the overlay list,
   // or the 1-3 number keys handled in the global input hook below.
   const SUGGESTIONS = ["Summarize this repo", "Find TODOs", "Run tests"];
-  let suggestionBox: Box | null = null;
   const showSuggestions = async (): Promise<void> => {
-    const list = new SelectList<string>(
-      "suggestions",
+    const list = new SelectList(
       SUGGESTIONS.map((s, i) => ({ value: s, label: `${i + 1}. ${s}` })),
       5,
-      defaultSelectListTheme,
+      buildSelectTheme(),
     );
-    const box = new Box(list, { title: "try — ↑↓+Enter or 1-3 fills the prompt (no send) · Esc dismisses" });
-    box.setInputTarget(list);
-    suggestionBox = box;
+    const body = new Container();
+    body.addChild(new Text(theme.bold("try — ↑↓+Enter or 1-3 fills the prompt (no send) · Esc dismisses"), 0, 0));
+    body.addChild(list);
+    const handle = showDialog(body, list);
+    suggestionsOpen = true;
     await new Promise<void>((resolve) => {
-      list.onSelect = (item) => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        suggestionBox = null;
-        editor.setText(item.value);
-        toast(`Filled: ${item.value}`);
+      let done = false;
+      const finish = (fill: string | null) => {
+        if (done) return;
+        done = true;
+        suggestionsOpen = false;
+        suggestionPick = null;
+        handle.hide();
+        tui.setFocus(editor);
+        if (fill !== null) {
+          editor.setText(fill);
+          toast(`Filled: ${fill}`);
+        }
         resolve();
       };
-      list.onCancel = () => {
-        screen.hideOverlay();
-        screen.setFocus(editor);
-        suggestionBox = null;
-        resolve();
-      };
-      screen.showOverlay(box);
+      suggestionPick = (value) => finish(value);
+      list.onSelect = (item) => finish(item.value);
+      list.onCancel = () => finish(null);
     });
   };
 
@@ -1145,8 +1212,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const raw = line.replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
     if (!raw.trim()) return;
     const trimmed = raw.trim();
-    editor.clear();
-    screen.requestRender();
+    editor.setText("");
+    tui.requestRender();
     if (trimmed === "?") {
       void runCommand("/help");
       return;
@@ -1242,8 +1309,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     options.approvalHook.current = null;
     unsubscribe?.();
     say(theme.muted("bye."));
-    screen.renderNow();
-    screen.stop();
+    tui.renderNow();
+    tui.stop();
     process.exit(0);
   };
 
@@ -1258,18 +1325,23 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   // --- global keys ----------------------------------------------------------------------------
-  screen.setInputHook((key) => {
-    if (screen.hasOverlay()) {
+  // Registered via addInputListener, which runs BEFORE focused components, so
+  // Esc-cancel for prompt dialogs is emulated here (pi-tui's Editor has no
+  // onEscape): a handled Esc returns {consume:true} to preempt the dialog.
+  tui.addInputListener((key) => {
+    // Esc cancels an open text-prompt dialog (preempts the dialog's editor).
+    if (promptDialog && matchesKey(key, "escape")) {
+      promptDialog.cancel();
+      return { consume: true };
+    }
+    if (tui.hasOverlay()) {
       // Number-key quick fill for the empty-state suggestions overlay.
-      if (suggestionBox && screen.overlayTop() === suggestionBox) {
-        for (let n = 0; n < SUGGESTIONS.length; n++) {
-          if (matchesKey(key, { char: String(n + 1) })) {
-            const value = SUGGESTIONS[n] ?? "";
-            screen.hideOverlay();
-            screen.setFocus(editor);
-            suggestionBox = null;
-            editor.setText(value);
-            toast(`Filled: ${value}`);
+      // Routes through the overlay's own finish path (fill, never send).
+      if (suggestionsOpen && suggestionPick) {
+        for (let n = 0; n < SUGGESTIONS.length && n < SUGGESTION_DIGITS.length; n++) {
+          const digit = SUGGESTION_DIGITS[n];
+          if (digit && matchesKey(key, digit)) {
+            suggestionPick(SUGGESTIONS[n] ?? "");
             return { consume: true };
           }
         }
@@ -1305,8 +1377,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return { consume: true };
     }
     if (matchesKey(key, "ctrl+s")) {
-      editor.stashPrompt();
-      screen.requestRender();
+      // Stash/restore the draft (pi-tui's Editor has no stashPrompt).
+      if (editor.getText().length > 0) {
+        stash = editor.getText();
+        editor.setText("");
+        toast("Draft stashed — Ctrl+S restores it.");
+      } else if (stash) {
+        editor.setText(stash);
+        stash = "";
+      }
+      tui.requestRender();
       return { consume: true };
     }
     if (matchesKey(key, "ctrl+r")) {
@@ -1314,7 +1394,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return { consume: true };
     }
     if (matchesKey(key, "ctrl+l")) {
-      screen.requestRender();
+      tui.requestRender();
       return { consume: true };
     }
     if (matchesKey(key, "shift+tab")) {
@@ -1326,7 +1406,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   printHeader();
   printStatus();
-  screen.start();
+  tui.start();
   if (manager.getActiveMessages().length === 0) {
     info("No history yet — pick a suggestion (↑↓+Enter or 1-3 fills the prompt, never sends) or type your own.");
     await showSuggestions();

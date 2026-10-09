@@ -1,70 +1,151 @@
-/**
- * @kern/tui — theme.
- *
- * Semantic ANSI styles, dark-first truecolor palette. Respects NO_COLOR
- * (any non-empty value disables color, checked dynamically).
- */
+import {
+	parseColor,
+	styleText,
+	type Color,
+	type EditorTheme as PiEditorTheme,
+	type MarkdownTheme as PiMarkdownTheme,
+	type SelectListTheme as PiSelectListTheme,
+} from "@earendil-works/pi-tui";
 
-const ESC = "\u001b[";
-const RESET = `${ESC}0m`;
+// Pi dark palette (dark.json). Built once at module load.
+const noColor = (process.env.NO_COLOR ?? "") !== "";
 
-function noColor(): boolean {
-  const v = process.env["NO_COLOR"];
-  return v !== undefined && v !== "";
+function sty(color: Color, extra?: { bold?: boolean; italic?: boolean; inverse?: boolean }): (s: string) => string {
+	if (noColor) return (s) => s;
+	return (s) => styleText(s, { fg: color, ...extra }, "truecolor");
 }
 
-export interface Theme {
-  user: (s: string) => string;
-  assistant: (s: string) => string;
-  tool: (s: string) => string;
-  error: (s: string) => string;
-  warn: (s: string) => string;
-  muted: (s: string) => string;
-  accent: (s: string) => string;
-  success: (s: string) => string;
-  bold: (s: string) => string;
-  /** Informational blue (borders, hints). */
-  info: (s: string) => string;
-  /** Added diff line (green). */
-  diffAdd: (s: string) => string;
-  /** Removed diff line (red). */
-  diffDel: (s: string) => string;
-  /** Full-width inverse highlight bar (selection). */
-  inverse: (s: string) => string;
-}
+const text = parseColor("okhsl(234 3% 89%)");
+const mutedC = parseColor("okhsl(229 6% 67%)");
+const violet = parseColor("okhsl(295 50% 67%)");
+const blue = parseColor("okhsl(232 54% 67%)");
+const green = parseColor("okhsl(159 59% 67%)");
+const red = parseColor("okhsl(20 72% 67%)");
+const yellow = parseColor("okhsl(83 88% 67%)");
+const warmString = parseColor("okhsl(52 67% 67%)");
+const borderC = parseColor("okhsl(231 57% 65%)");
+const blueBg = parseColor("okhsl(233 41% 24%)");
 
-function paint(code: string): (s: string) => string {
-  return (s) => (noColor() ? s : `${ESC}${code}m${s}${RESET}`);
-}
-
-function identity(s: string): string {
-  return s;
-}
-
-export const theme: Theme = {
-  user: paint("1;38;2;125;211;252"), // bold sky
-  assistant: identity, // default terminal fg
-  tool: paint("38;2;234;179;8"), // amber
-  error: paint("1;38;2;248;113;113"), // bold soft red
-  warn: paint("38;2;251;191;36"), // amber-yellow
-  muted: paint("2;38;2;148;163;184"), // dim slate
-  accent: paint("1;38;2;167;139;250"), // bold violet
-  success: paint("38;2;52;211;153"), // mint green
-  bold: paint("1"),
-  info: paint("38;2;56;189;248"), // sky blue
-  diffAdd: paint("38;2;74;222;128"), // green
-  diffDel: paint("38;2;248;113;113"), // red
-  inverse: paint("7;1"), // inverse + bold
+export const theme = {
+	user: sty(blue),
+	assistant: sty(text),
+	tool: sty(mutedC),
+	error: sty(red),
+	warn: sty(yellow),
+	muted: sty(mutedC),
+	accent: sty(violet),
+	success: sty(green),
+	bold: sty(text, { bold: true }),
+	info: sty(blue),
+	diffAdd: sty(green),
+	diffDel: sty(red),
+	inverse: sty(text, { inverse: true }),
 };
 
-/** Wrap a full-width status-bar row in its background (skipped under NO_COLOR). */
 export function statusBg(s: string): string {
-  if (noColor()) return s;
-  return `${ESC}48;2;30;41;59m${ESC}38;2;226;232;240m${s}${RESET}`;
+	if (noColor) return s;
+	return styleText(s, { fg: text, bg: blueBg }, "truecolor");
 }
 
-/** Re-apply inverse after embedded resets so a highlight bar stays solid. */
-export function keepInverse(inner: string): string {
-  if (noColor()) return inner;
-  return `${ESC}7m${inner.split(RESET).join(`${RESET}${ESC}7m`)}${RESET}`;
+const KEYWORDS = new Set([
+	"const", "let", "var", "function", "return", "if", "else", "for", "while",
+	"do", "switch", "case", "break", "continue", "default", "class", "extends",
+	"import", "export", "from", "await", "async", "new", "try", "catch",
+	"finally", "throw", "typeof", "instanceof", "in", "of", "void", "delete",
+	"null", "undefined", "true", "false", "this", "super", "static", "get",
+	"set", "public", "private", "protected", "readonly", "interface", "type",
+	"enum", "implements", "def", "lambda", "pass", "raise", "with", "as",
+	"is", "not", "and", "or", "elif", "while", "for",
+]);
+
+const TOKEN_RE =
+	/(\/\/[^\n]*|#[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)|\b(\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|([A-Za-z_$][\w$]*)/g;
+
+const commentFn = sty(mutedC);
+const keywordFn = sty(blue);
+const fnFn = sty(yellow);
+const stringFn = sty(warmString);
+const numberFn = sty(green);
+const typeFn = sty(violet);
+const baseFn = sty(green);
+const gapFn = sty(mutedC);
+
+function styleGap(gap: string): string {
+	if (gap === "" || /^\s+$/.test(gap)) return gap;
+	return gapFn(gap);
+}
+
+function highlightLine(line: string): string {
+	const trimmed = line.trimStart();
+	if (trimmed.startsWith("+") && !trimmed.startsWith("+++")) return theme.diffAdd(line);
+	if (trimmed.startsWith("-") && !trimmed.startsWith("---")) return theme.diffDel(line);
+	TOKEN_RE.lastIndex = 0;
+	let out = "";
+	let cursor = 0;
+	for (;;) {
+		const m = TOKEN_RE.exec(line);
+		if (m === null || m[0] === "") break;
+		const start = m.index;
+		if (start > cursor) out += styleGap(line.slice(cursor, start));
+		const comment = m[1];
+		const str = m[2];
+		const num = m[3];
+		const word = m[4];
+		if (comment !== undefined) out += commentFn(comment);
+		else if (str !== undefined) out += stringFn(str);
+		else if (num !== undefined) out += numberFn(num);
+		else if (word !== undefined) {
+			const after = line.slice(TOKEN_RE.lastIndex);
+			if (KEYWORDS.has(word)) out += keywordFn(word);
+			else if (/^\s*\(/.test(after)) out += fnFn(word);
+			else if (/^[A-Z]/.test(word)) out += typeFn(word);
+			else out += baseFn(word);
+		}
+		cursor = TOKEN_RE.lastIndex;
+	}
+	if (cursor < line.length) out += styleGap(line.slice(cursor));
+	return out;
+}
+
+export function highlightCode(code: string, lang?: string): string[] {
+	void lang;
+	return code.split("\n").map(highlightLine);
+}
+
+export function buildMarkdownTheme(): PiMarkdownTheme {
+	return {
+		heading: sty(yellow),
+		link: sty(blue),
+		linkUrl: sty(mutedC),
+		code: sty(violet),
+		codeBlock: sty(green),
+		codeBlockBorder: sty(mutedC),
+		quote: sty(mutedC),
+		quoteBorder: sty(mutedC),
+		hr: sty(mutedC),
+		listBullet: sty(violet),
+		bold: sty(text, { bold: true }),
+		italic: sty(text, { italic: true }),
+		strikethrough: sty(text),
+		underline: sty(text),
+		highlightCode,
+		codeBlockIndent: "  ",
+	};
+}
+
+export function buildSelectTheme(): PiSelectListTheme {
+	return {
+		selectedPrefix: sty(violet, { bold: true }),
+		selectedText: statusBg,
+		description: sty(mutedC),
+		scrollInfo: sty(mutedC),
+		noMatch: sty(yellow),
+	};
+}
+
+export function buildEditorTheme(): PiEditorTheme {
+	return {
+		borderColor: noColor ? (s: string) => s : (s: string) => styleText(s, { fg: borderC }, "truecolor"),
+		selectList: buildSelectTheme(),
+	};
 }
