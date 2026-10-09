@@ -25,24 +25,34 @@ Options and their defaults:
 | `requestApproval` | absent (= deny) | Approval sink for write/exec/destructive ops |
 | `loadResources` | `true` | AGENTS.md + skill catalog |
 | `enableCompaction` | `true` | Automatic compaction at safe boundaries |
-| `model` | no-op fake | **Inject a real `ModelAdapter` here** |
+| `model` | no-op fake | Real adapter via `@kern/model` discovery (`createAdapterFor`); fake only when nothing is configured |
 | `resume` | `false` | Resume most-recent session for cwd |
 | `storageRoot` | `~/.kern/agent/sessions` | Override for tests and isolation |
 
 `AgentSession` is the entire public surface: `prompt(text, {signal?})`,
-`subscribe(listener)`, `budgetUsage()`. TUI, RPC, tests, and subagents all
-build on these three methods.
+`subscribe(listener)`, `budgetUsage()`, `isBusy()`, `setModel(adapter)`,
+`modelInfo()`, `compact(instructions?)`, `contextUsage()`,
+`approvalMode()` / `setApprovalMode(...)`, `allowToolForSession(tool)`,
+`toolNames()`, `callToolAsUser(name, args)`. TUI, tests, and subagents all
+build on these methods — never on kernel internals.
 
-## 5.2 CLI (`@kern/cli`, print mode)
+## 5.2 CLI (`@kern/cli`, print + interactive modes)
 
-Thin by design: parse flags → create session → subscribe → prompt.
-Flags: `--read-only` (allowlist `read` only), `--max-turns N`, `--cwd DIR`,
-`--no-resources`, `--no-compaction`, `--resume`, `--help`.
+Thin by design: parse flags → resolve model via `@kern/model` →
+create session → subscribe → prompt (print) or hand off to `@kern/tui`
+(interactive, the default on a TTY with no prompt).
+Flags: `--read-only`, `--max-turns N`, `--cwd DIR`,
+`--no-resources`, `--no-compaction`, `--resume`, `--interactive/-i`,
+`--print`, `--list-models`, `--provider NAME`, `--model [provider/]id`,
+`--base-url URL`, `--api-key KEY`, `--help` (env: `KERN_PROVIDER`,
+`KERN_MODEL`, `KERN_BASE_URL`, `KERN_API_KEY`; precedence
+flag → env → config file).
 
-Two rules the CLI follows that every future UI must copy:
+Two rules the CLI follows that every UI must copy:
 
-1. **Approval**: TTY gets an interactive `[y/N]` prompt; non-TTY denies.
-   Fail closed, always.
+1. **Approval**: interactive TUI gets an arrow-key dialog (once /
+   session / deny); print mode gets a TTY `[y/N]` prompt; non-TTY
+   denies. Fail closed, always.
 2. **Streams**: human text on stdout, machine/status on stderr. stdout stays
    clean for piping; this is what keeps future `--mode json` / RPC viable.
 

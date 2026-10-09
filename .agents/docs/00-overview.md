@@ -15,6 +15,7 @@ on top of which different types of agents are built.
 | 05 | `05-composition.md` | Facade, CLI, and how to build a new agent type |
 | 06 | `06-safety-model.md` | Trust zones, defaults, user controls |
 | 07 | `07-status.md` | What is done, what is missing, what is next |
+| 08 | `08-tui.md` | Interactive terminal UI on pi-tui |
 
 ## What Kern is
 
@@ -74,9 +75,10 @@ flowchart LR
     store["@kern/session-store<br/>jsonl-store,<br/>session-manager,<br/>invariants"]
     tools["@kern/tools<br/>registry, policy,<br/>read/write/edit/bash"]
     core["@kern/agent-core<br/>agent, context,<br/>budgets, compaction,<br/>retry, resources"]
-    model["@kern/model<br/>EMPTY SCAFFOLD<br/>adapters go here"]
+    model["@kern/model<br/>openai-compatible<br/>adapter + discovery + auth"]
+    tui["@kern/tui<br/>fullscreen TUI<br/>on pi-tui (MIT)"]
     facade["@kern/coding-agent<br/>createAgentSession"]
-    cli["@kern/cli<br/>print mode"]
+    cli["@kern/cli<br/>print + interactive"]
 
     protocol --> store
     protocol --> tools
@@ -85,10 +87,12 @@ flowchart LR
     store --> core
     tools --> core
     core --> facade
-    model -.-> facade
+    model --> facade
     store --> facade
     tools --> facade
     facade --> cli
+    facade --> tui
+    model --> tui
 ```
 
 Dependency rules (enforced by convention, verified by review):
@@ -98,6 +102,10 @@ Dependency rules (enforced by convention, verified by review):
 - Tools never import the model adapter.
 - Persistence never depends on provider SDKs.
 - The facade depends inward only; CLI depends on the facade only.
+- The TUI observes `AgentEvent`s and acts only via `AgentSession`
+  (+ `@kern/model` discovery for provider setup); it never touches
+  kernel internals. Its only third-party dependency is
+  `@earendil-works/pi-tui` (MIT).
 
 ## The one-sentence contract
 

@@ -1,80 +1,95 @@
 # 08 — TUI (`@kern/tui`)
 
-Scrollback-mode terminal UI on our own zero-dependency component framework:
-differential main-screen renderer, synchronized output (CSI 2026),
-multiline editor, Markdown with syntax highlighting, searchable select
-lists, loader, boxes, status bar, tool cards.
+Fullscreen Pi-style terminal UI on `@earendil-works/pi-tui` v1.1.0
+(MIT): transcript streams into a scrollable viewport with the prompt
+docked at the bottom; Pi's dark palette throughout. Five source files
+(`index.ts`, `theme.ts`, `components.ts`, `autocomplete.ts`, `tui.ts`).
+The TUI observes `AgentEvent`s and acts only through `AgentSession`
+(+ `@kern/model` discovery for provider setup).
 
-Scrollback-mode terminal UI: transcript streams into native scrollback, a
-raw-mode multiline editor owns the bottom block while idle. Zero
-dependencies. The TUI observes `AgentEvent`s and acts only through the
-`AgentSession` API.
+## Layout model (Pi's `createChatViewport` pattern)
 
-## Layout model
+```mermaid
+flowchart TB
+    S["ScrollView(transcript)<br/>follow:end, primary, grows"]
+    D["dock (fixed bottom)<br/>queue → toast → editor → statusBar"]
+    S --> R["VStack root<br/>setLayoutRoot"]
+    D --> R
+```
 
-- While idle: the input block is the last screen content; every keystroke
-  rewrites it in place with the hardware cursor repositioned.
-- While busy: the last screen row is always exactly one status row
-  (spinner `⠋ 12s · running bash…` or queue-draft echo `… queue: …`),
-  cursor on it, no trailing newline. Every print clears that row first,
-  writes, then redraws it — so output and typing never garble.
-- Overlays (model picker, history search, approval dialog) suspend the
-  editor, render below the cursor, and erase their rows on close.
+- Fullscreen alt-screen (`TuiAltScreen`); exit restores the previous
+  screen, so the farewell prints to stdout *after* `stop()`.
+- Transcript (`Container`) holds Markdown replies, tool cards, loader,
+  boxes; `ScrollView` follows the end and wheel-scrolls.
+- Dock: queue panel (pending messages, cap 5) → toast line (4s
+  transient notices; errors stay in the transcript) → pi-tui `Editor`
+  (draws its own border — never wrapped in a `Box`) → `StatusBar`
+  (`provider/model │ mode │ ctx% │ turns · calls · time`).
+- Overlays float centered (`anchor: "center"`, 80% width): pickers,
+  approvals, wizard steps, suggestions. Dialogs needing text input use
+  the bare pi-tui `Editor` (its frame *is* the dialog frame);
+  list dialogs are a titled `Box` around a `Text` header + `SelectList`.
+- Overlay input: pi-tui focuses the overlay root, so each dialog is an
+  `OverlayDialog` wrapper that forwards keys to the interactive child.
+  The global `addInputListener` runs *before* focused components, which
+  is how Esc-cancel (pi-tui `Editor` has no `onEscape`) and suggestion
+  digits 1–3 are implemented.
+
+## What's pi-tui's, what's Kern's
+
+| pi-tui primitive | Used for |
+|---|---|
+| `TuiAltScreen`, `ProcessTerminal` | Renderer, raw mode, alt-screen, mouse/wheel |
+| `Editor` | Main prompt + dialog inputs (wrap, kill ring, undo, IME, paste, dropdown) |
+| `CombinedAutocompleteProvider` | `/command` + fuzzy `@file` completion (`fd` binary for files) |
+| `SelectList` | Model picker, wizard steps, approvals, history, recovery, suggestions |
+| `Markdown` (`marked` parser) | Assistant replies, with our highlight/diff theme |
+| `Loader`, `Container`/`Text`/`Spacer`, `VStack`, `ScrollView` | Spinner, layout, scroll |
+| `matchesKey`, `visibleWidth`/`truncateToWidth` | Input matching, width math |
+
+Kern's own: Pi-dark `theme.ts` (okhsl tokens from Pi's `dark.json`
+via `parseColor`+`styleText`), bordered `Box`, `StatusBar`, `ToolCard`
+(`◈/✔/✖`, capped live output, diff hunks), and all of `tui.ts`
+orchestration below. pi-tui's `Box` is padding-only (no borders) and
+its `Text`/`Loader`/key-id shapes differ — that is why these pieces
+stay Kern-side.
 
 ## Input
 
-Multiline (`Alt+Enter`, `Ctrl+J` where delivered, bracketed paste inserts
-literally). Readline bindings: `Ctrl+A/E`, `Alt+B/F` + `Ctrl+←/→`
-(alnum word class), `Ctrl+W` (to whitespace), `Alt+D`, `Ctrl+K/U/Y`
-(kill ring), `Ctrl+S` stash/restore, `Ctrl+R` history search overlay,
-`Tab` accepts ghost completion, `Esc` clears, `Ctrl+L` redraws,
-`Ctrl+D` twice exits. Enter submits (`\r` and `\n` both submit — some
-pty stacks translate CR→LF); lone `Esc` at a chunk edge waits 40 ms so
-split arrow/alt sequences still parse.
-
-Ghost completion: leading or mid-prompt `/command` (with `+N` count) and
-`@file` from a cached workspace walk (skips `node_modules/.git/dist…`,
-cap 3000). `Tab` inserts the top match. `@path` expands on submit to
-`<file path>content</file>` (40 KB cap; missing files stay literal with a
-warning). Pasted invisible Unicode (zero-width/bidi/tags, keeping ZWNJ)
-is stripped on submit with a review-and-resend notice.
+- `Enter` sends; `Shift+Enter`/`Alt+Enter`/`Ctrl+J` newline; `Tab`
+  accepts completion; `↑↓` navigate dropdown/history.
+- `Ctrl+C` abort (or clear draft), `Ctrl+D` twice exits,
+  `Ctrl+Q` clears queue, `Backspace` on empty prompt pops queued item,
+  `Ctrl+S` stash/restore draft, `Ctrl+R` history search,
+  `Ctrl+L` redraw, `Shift+Tab` cycles `ask` ↔ `auto-allowlist`.
+- `/command` ghost + dropdown; `@path` expands on submit to
+  `<file path>content</file>` (40 KB cap; missing stays literal).
+  Pasted invisible Unicode is stripped with a review-and-resend notice.
+- `?` help, `!cmd` shell mode (output shown, agent responds to it).
 
 ## While a turn runs
 
-Typing builds a queue draft on the status row; `Enter` queues (cap 5),
-`Ctrl+C`/lone `Esc` aborts (queued messages still send next, Claude-style).
-`!cmd` shell mode runs `bash` directly as user origin (policy still
-applies) and feeds the output back as the next prompt.
+Typing queues (cap 5, numbered, auto-sent in order); `Ctrl+C` aborts.
+`Loader` shows activity + elapsed (`running bash`, `compacting
+context`, `retrying (…)`); compaction/retry surface as toasts;
+auth failure (`E_MODEL_AUTH`) renders a persistent card *plus* a
+recovery dialog: Reconnect (`/connect`) / Retry turn / Switch model /
+Dismiss — no dead ends.
 
 ## Approvals
 
-Arrow-key dialog — *Yes, run once / Yes, always allow {tool} this session /
-No (Esc)* — instead of y/N. "Always" calls `allowToolForSession`;
-`Esc`/Ctrl+C declines (fail closed). `Shift+Tab` cycles approval modes
-`manual (ask)` ↔ `auto` (per-op prompts off; destructive/deny/sensitive
-rules still enforced), shown in header and status.
-
-## Rendering
-
-Assistant text is styled per completed line (headings, bold, inline code,
-fences, quotes, lists); only fence state crosses lines. Tool cards
-(`◈/✔/✖`), compaction/retry notices, and a per-turn status line
-(model · mode · turns · calls · seconds · ctx %) complete the transcript.
+Arrow-key dialog — *Yes, run once / Yes, always allow {tool} this
+session / No (Esc)* — returning `true` / `"session"` / `false` through
+the kernel approval hook. Runtime arguments pretty-printed (800ch cap);
+destructive patterns (`rm -rf`, `git reset --hard`, …) render the
+dialog in danger style but the turn continues on denial.
 
 ## Commands
 
-`/help /model /compact [note] /diff /new /export [file] /budget /clear
-/quit`. `/new` swaps in a fresh session (resubscribed, file cache
-refreshed); `/export` dumps the active path to markdown.
-
-## Visual structure
-
-- Header banner in a titled box (product, model, mode, cwd), divider rule.
-- Prompt editor inside a `prompt` box; cursor positioned via marker scan.
-- Full-width status bar (model │ mode │ ctx% │ turns/calls/time).
-- Tool executions render as live cards: header with arg summary, streamed
-  output (capped, "+N more"), ✔/✖ footer with duration. Edit results show
-  a unified diff hunk.
-- Code fences render as bordered blocks with language label.
-- Approval / model / history dialogs are titled boxes; dialogs route input
-  to the interactive child via `Box.setInputTarget`.
+`/help /model [filter] /models /keys /connect /compact [note] /diff
+/new /export [file] /budget /clear /quit` (+ `/exit` alias).
+`/connect` = preset → key method (paste / `$VAR` / `!cmd` / none) →
+live `testProvider` with Edit-URL / Edit-key / manual-id recovery →
+model pick → set-as-default → save (`models.json` + `auth.json`) →
+instant switch. Esc cancels any step with nothing written.
+`/new` swaps sessions; `/export` dumps the active path to markdown.
