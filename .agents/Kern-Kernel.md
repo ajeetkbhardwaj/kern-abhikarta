@@ -1,7 +1,7 @@
 # Kern Kernel — From First Principles to Implementation
 
 A detailed, implementation-oriented record of the **Kern** coding agent as
-actually built in this repository: what each package does, the exact
+actually buimt in this repository: what each package does, the exact
 contracts between them, the behaviors verified by tests and live runs,
 and what is deliberately missing. Nothing in this document is aspirational
 — every claim maps to source under `packages/` (verified at the commit
