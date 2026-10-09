@@ -235,3 +235,99 @@ pnpm kern                                     # interactive TUI
 pnpm kern --read-only "find all TODOs"        # safe inspection
 pnpm kern --resume                            # continue last session
 ```
+
+---
+
+# Part B — Developer guide: publishing Kern as npm packages
+
+How to turn this monorepo into installable packages (`npm i -g kern`
+/ `npx kern`). Current state: all 8 packages are `private: true`,
+version `0.0.1`, with `exports` pointing at TypeScript source (runs
+under `tsx`, not publishable as-is). Two routes below; **Option A is
+recommended** — the library APIs are pre-1.0 and churning, so don't
+promise stability you can't keep.
+
+## Current packaging facts (verify before you publish)
+
+- No `bin`, no `license` field, no `files` allowlist in any
+  `package.json`; root `engines` says Node `>=20` but `@kern/tui`
+  (via `@earendil-works/pi-tui`) needs Node `>=22.19`.
+- `packages/cli/src/main.ts` has no shebang and runs `main()` on
+  import — fine for a bundled bin entry, wrong for a library.
+- `tsconfig.json` sets `noEmit: true` (typecheck only); publishing
+  needs a build step, not the typecheck config.
+- The runnable artifact today is an **esbuild single-file bundle**:
+  `packages/cli/dist/kern.mjs` (gitignored, rebuilt, not committed).
+
+## Option A — one `kern` bin package (recommended)
+
+Ship a single self-contained executable; keep `@kern/*` private.
+
+```bash
+# 1. Build the bundle (verified command — pi-tui inlined, 854 KB)
+node_modules/.pnpm/esbuild@0.28.2/node_modules/esbuild/bin/esbuild \
+  packages/cli/src/main.ts --bundle --platform=node --target=node22 \
+  --format=esm --outfile=packages/cli/dist/kern.mjs \
+  --banner:js='#!/usr/bin/env node' --log-level=warning
+chmod +x packages/cli/dist/kern.mjs
+
+# 2. Smoke-test the artifact (all three must pass)
+./packages/cli/dist/kern.mjs --help
+./packages/cli/dist/kern.mjs --list-models --cwd /tmp
+printf '\x1b' | script -qec "./packages/cli/dist/kern.mjs -i --cwd /tmp" /dev/null
+#    ^ fullscreen TUI boots (alt-screen engages, header renders)
+
+# 3. Publish under a new top-level folder, e.g. packages/kern-bin/package.json:
+```
+
+```json
+{
+  "name": "kern",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Kern — minimal terminal coding agent",
+  "type": "module",
+  "bin": { "kern": "./dist/kern.mjs" },
+  "files": ["dist/kern.mjs"],
+  "engines": { "node": ">=22.19.0" }
+}
+```
+
+```bash
+# 4. Copy the bundle in, dry-run, publish
+cp ../cli/dist/kern.mjs ./dist/kern.mjs
+npm pack --dry-run   # must list ONLY dist/kern.mjs + package.json
+npm publish --access public
+```
+
+Users then run `npm i -g kern` / `npx kern "…"` — no `tsx`, no clone,
+plain Node 22+. The bundle carries `zod`, `marked`, and pi-tui's JS;
+pi-tui's optional native clipboard module degrades gracefully when
+absent (verified: no `ERR_MODULE_NOT_FOUND` at boot).
+
+## Option B — publish all `@kern/*` libraries + bin
+
+Only when the APIs stabilize. Per package: drop `"private": true`,
+set a real version (single `0.1.0` across all, bumped together),
+add `"license": "MIT"` + `"files": ["dist"]`, compile with `tsc`
+into `dist` (add a `tsconfig.build.json` with `noEmit: false`,
+`declaration: true`, per-package `outDir`), repoint
+`exports`/`types` at `./dist/index.js`, add the `bin` entry to
+`@kern/cli` (plus a `#!/usr/bin/env node` shebang and an
+import-guard so importing the library doesn't launch the CLI).
+Publish leaf-first with `pnpm -r publish` — pnpm rewrites
+`workspace:*` to the released versions automatically:
+`protocol` → `session-store`/`tools`/`model` → `agent-core` →
+`coding-agent` → `tui` → `cli`. Keep the esbuild bundle as the
+`kern` distribution even here; libraries are for embedders.
+
+## Pre-publish checklist (both options)
+
+- [ ] `pnpm typecheck` clean; `pnpm test` green (20 model tests + new)
+- [ ] One live pty pass: boot → submit → settle → `/connect` → `/quit`
+- [ ] Version bumped once across every touched `package.json`
+- [ ] `LICENSE` (MIT) at repo root; `npm pack --dry-run` file list reviewed
+- [ ] `engines` say `>=22.19.0` everywhere (pi-tui floor)
+- [ ] `Guide.md` install section updated from `git clone` to `npm i -g kern`
+- [ ] First publish uses `--access public` (scoped or not); enable
+      npm provenance (`--provenance`) in CI when wired up
