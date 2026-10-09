@@ -20,7 +20,7 @@ import { Container, Text, Spacer, Box, StatusBar, Rule, ToolCard } from "./compo
 import { Editor, defaultEditorTheme } from "./editor.js";
 import { SelectList, Loader, defaultSelectListTheme } from "./select-list.js";
 import { Markdown, defaultMarkdownTheme } from "./markdown.js";
-import { buildAutocomplete } from "./autocomplete.js";
+import { KernAutocomplete } from "./autocomplete.js";
 import { matchesKey } from "./keys.js";
 
 export interface InteractiveOptions {
@@ -70,10 +70,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const screen = new Screen();
   const transcript = new Container();
   const statusBar = new StatusBar();
-  const editor = new Editor(screen.tui, "› ");
+  const editor = new Editor("› ");
   const editorBox = new Box(editor, { title: "prompt" });
-  const autocomplete = buildAutocomplete(COMMANDS, cwd);
+  const autocomplete = new KernAutocomplete(COMMANDS, cwd);
   editor.setAutocompleteProvider(autocomplete);
+  await autocomplete.refreshFiles();
 
   let busy = false;
   let abort: AbortController | null = null;
@@ -490,7 +491,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
    * resolves null. Typed secrets are never echoed back by the caller.
    */
   const promptText = async (title: string, initial?: string): Promise<string | null> => {
-    const ed = new Editor(screen.tui, "› ");
+    const ed = new Editor("› ");
     if (initial) ed.setText(initial);
     const body = new Container();
     body.addChild(new Text(theme.muted("Enter submits · Esc cancels"), 0, 0));
@@ -1041,6 +1042,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           queue = [];
           renderQueue();
           subscribe();
+          await autocomplete.refreshFiles();
           transcript.clear();
           printHeader();
           printStatus();
@@ -1104,6 +1106,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         abort = null;
         if (!exiting) {
           printStatus();
+          void autocomplete.refreshFiles();
           const next = queue.shift();
           renderQueue();
           if (next !== undefined) {

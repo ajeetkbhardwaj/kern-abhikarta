@@ -1,20 +1,11 @@
 /**
  * @kern/tui — SelectList (searchable selection) and Loader (spinner).
- *
- * The SelectList keeps our public API (title header, `disabled` items,
- * substring filtering over label+description, footer hints) and delegates
- * item-row layout to @earendil-works/pi-tui's SelectList.
  */
 
 import type { Component } from "./component.js";
 import { theme, keepInverse } from "./theme.js";
-import { truncateToWidth } from "./text.js";
+import { truncateToWidth, visibleWidth } from "./text.js";
 import { matchesKey } from "./keys.js";
-import {
-  SelectList as PiSelectList,
-  type SelectItem as PiSelectItem,
-  type SelectListTheme as PiSelectListTheme,
-} from "@earendil-works/pi-tui";
 
 export interface SelectItem<T = string> {
   value: T;
@@ -45,20 +36,27 @@ export const defaultSelectListTheme: SelectListTheme = {
   noMatch: theme.muted,
 };
 
-/** Map our theme roles onto the pi widget theme. */
-function toPiTheme(t: SelectListTheme): PiSelectListTheme {
-  const highlight = t.highlight ?? keepInverse;
-  return {
-    // NOTE: pi-tui v1.1.0 hardcodes its "→ " cursor and never calls
-    // selectedPrefix; mapped anyway in case a later version uses it.
-    selectedPrefix: t.selectedPrefix,
-    // pi wraps the whole selected row (cursor + label + description) in
-    // selectedText, so fold our highlight bar in here.
-    selectedText: (s: string) => highlight(t.selectedText(s)),
-    description: t.description,
-    scrollInfo: t.scrollInfo,
-    noMatch: t.noMatch,
-  };
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Highlight every case-insensitive occurrence of the filter query. */
+function highlightMatch(label: string, query: string, match: (s: string) => string): string {
+  const q = query.trim();
+  if (!q) return label;
+  const re = new RegExp(escapeRegExp(q), "gi");
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  // Guard against pathological backtracking on long labels.
+  let spans = 0;
+  while ((m = re.exec(label)) !== null && spans < 16) {
+    out += label.slice(last, m.index) + match(m[0]);
+    last = m.index + m[0].length;
+    spans++;
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return out + label.slice(last);
 }
 
 export class SelectList<T = string> implements Component {
@@ -68,28 +66,21 @@ export class SelectList<T = string> implements Component {
 
   private filter = "";
   private index = 0;
-  private inner: PiSelectList;
-  /** Pi items for the current filtered view; parallel to filtered(). */
-  private piFiltered: PiSelectItem[] = [];
 
   constructor(
     private readonly title: string,
     private readonly items: Array<SelectItem<T>>,
     private readonly maxVisible = 10,
     private readonly theme_: SelectListTheme = defaultSelectListTheme,
-  ) {
-    this.inner = this.buildInner();
-  }
+  ) {}
 
   setFilter(filter: string): void {
     this.filter = filter;
     this.index = 0;
-    this.inner = this.buildInner();
   }
 
   setSelectedIndex(index: number): void {
     this.index = Math.max(0, Math.min(index, Math.max(0, this.filtered().length - 1)));
-    this.inner.setSelectedIndex(this.index);
   }
 
   filtered(): Array<SelectItem<T>> {
@@ -100,83 +91,39 @@ export class SelectList<T = string> implements Component {
     );
   }
 
-  /**
-   * (Re)build the inner pi widget for the current filtered view. The pi
-   * widget filters by value-prefix only, so we filter ourselves (substring
-   * over label+description, as before) and hand pi the visible subset with
-   * an empty filter. Disabled flags are stripped for pi and enforced in the
-   * wired onSelect below via the parallel array.
-   */
-  private buildInner(): PiSelectList {
-    const list = this.filtered();
-    if (this.index >= list.length) this.index = Math.max(0, list.length - 1);
-    this.piFiltered = list.map((item) => ({
-      value: typeof item.value === "string" ? item.value : item.label,
-      label: item.label,
-      description: item.description,
-    }));
-    const inner = new PiSelectList(
-      this.piFiltered,
-      Math.max(1, this.maxVisible),
-      toPiTheme(this.theme_),
-    );
-    inner.onSelect = () => {
-      const selected = inner.getSelectedItem();
-      const at = selected ? this.piFiltered.indexOf(selected) : -1;
-      const item = at >= 0 ? list[at] : undefined;
-      // Disabled (or vanished) choice: stay open, do nothing.
-      if (item && !item.disabled) this.onSelect?.(item);
-    };
-    inner.onCancel = () => {
-      this.onCancel?.();
-    };
-    inner.onSelectionChange = () => {
-      const selected = inner.getSelectedItem();
-      const at = selected ? this.piFiltered.indexOf(selected) : -1;
-      if (at >= 0) {
-        this.index = at;
-        const item = list[at];
-        if (item) this.onSelectionChange?.(item);
-      }
-    };
-    inner.setSelectedIndex(this.index);
-    return inner;
-  }
-
   handleInput(key: string): boolean {
     if (matchesKey(key, "escape") || matchesKey(key, "ctrl+c")) {
-      // Forward so pi drives onCancel through the wired callback above.
-      this.inner.handleInput(key);
+      this.onCancel?.();
       return true;
     }
     if (matchesKey(key, "enter")) {
-      // Forward: pi calls the wired onSelect, which drops disabled items.
-      this.inner.handleInput(key);
+      const item = this.filtered()[this.index];
+      if (item && !item.disabled) this.onSelect?.(item);
+      else this.onCancel?.();
       return true;
     }
-    if (matchesKey(key, "up") || matchesKey(key, "down")) {
-      // Forward: pi moves its cursor (with wrap) and notifies through the
-      // wired onSelectionChange, which syncs this.index. Clamp back in case
-      // pi wrapped around an empty list.
-      this.inner.handleInput(key);
-      const selected = this.inner.getSelectedItem();
-      const at = selected ? this.piFiltered.indexOf(selected) : -1;
-      if (at >= 0) this.index = at;
-      else this.setSelectedIndex(this.index);
+    if (matchesKey(key, "up")) {
+      this.setSelectedIndex(this.index - 1);
+      const item = this.filtered()[this.index];
+      if (item) this.onSelectionChange?.(item);
+      return true;
+    }
+    if (matchesKey(key, "down")) {
+      this.setSelectedIndex(this.index + 1);
+      const item = this.filtered()[this.index];
+      if (item) this.onSelectionChange?.(item);
       return true;
     }
     if (matchesKey(key, "backspace")) {
       if (this.filter.length > 0) {
         this.filter = this.filter.slice(0, -1);
         this.index = 0;
-        this.inner = this.buildInner();
       }
       return true;
     }
     if (key.length === 1 && key >= " " && ![...key].some((c) => /[\u0000-\u001f\u007f]/.test(c))) {
       this.filter += key;
       this.index = 0;
-      this.inner = this.buildInner();
       return true;
     }
     return false;
@@ -185,44 +132,58 @@ export class SelectList<T = string> implements Component {
   render(width: number): string[] {
     const t = this.theme_;
     const w = Math.max(8, width);
+    const match = t.match ?? ((s: string) => theme.accent(theme.bold(s)));
+    const highlight = t.highlight ?? keepInverse;
     const disabledStyle = t.disabledRow ?? theme.muted;
     const list = this.filtered();
     if (this.index >= list.length) this.index = Math.max(0, list.length - 1);
-    this.inner.setSelectedIndex(this.index);
     const pos = list.length > 0 ? `${this.index + 1}/${list.length}` : "0/0";
     const head = (this.title ? theme.bold(this.title) : theme.bold("select")) +
       (this.filter ? theme.muted(`  /${this.filter}`) : "") +
       t.scrollInfo(`  ${pos}`);
     const rows: string[] = [truncateToWidth(head, w, "…")];
-    const innerRows = this.inner.render(w);
-    // Restyle disabled rows: pi knows nothing about `disabled`, so rebuild
-    // those rows muted with an "· unavailable" hint. Item rows come first;
-    // pi appends at most one scroll-indicator row after them.
     const cap = Math.max(1, this.maxVisible);
-    const start = Math.min(
-      Math.max(0, this.index - Math.floor(cap / 2)),
-      Math.max(0, list.length - cap),
-    );
+    const start = Math.min(Math.max(0, this.index - Math.floor(cap / 2)), Math.max(0, list.length - cap));
     const end = Math.min(list.length, start + cap);
-    const itemCount = Math.max(0, end - start);
-    for (let ri = 0; ri < innerRows.length; ri++) {
-      const row = innerRows[ri] ?? "";
-      const item = ri < itemCount ? list[start + ri] : undefined;
-      if (item?.disabled) {
-        const cursor = start + ri === this.index ? "→ " : "  ";
+    for (let gi = start; gi < end; gi++) {
+      const item = list[gi];
+      if (!item) continue;
+      const selected = gi === this.index;
+      const cursor = selected ? t.selectedPrefix("❯ ") : "  ";
+      if (item.disabled) {
+        const label = disabledStyle(item.label);
         const hint = item.description ? t.description(`  ${item.description}`) : "";
-        rows.push(truncateToWidth(cursor + disabledStyle(item.label) + hint + t.description("  · unavailable"), w, "…"));
+        const dim = cursor + label + hint + t.description("  · unavailable");
+        rows.push(truncateToWidth(dim, w, "…"));
+        continue;
+      }
+      const label = selected
+        ? t.selectedText(highlightMatch(item.label, this.filter, match))
+        : highlightMatch(item.label, this.filter, match);
+      const hint = item.description ? t.description(`  ${item.description}`) : "";
+      if (selected) {
+        const inner = cursor + label + hint;
+        const clipped = visibleWidth(inner) > w ? truncateToWidth(inner, w, "…") : inner;
+        const padded = clipped + " ".repeat(Math.max(0, w - visibleWidth(clipped)));
+        rows.push(highlight(padded));
       } else {
-        rows.push(row);
+        rows.push(truncateToWidth(cursor + label + hint, w, "…"));
       }
     }
+    if (list.length > cap) {
+      const above = start;
+      const below = list.length - end;
+      const bits = [`${pos}`];
+      if (above > 0) bits.push(`▲${above}`);
+      if (below > 0) bits.push(`▼${below}`);
+      rows.push(t.scrollInfo(`  ‹ ${bits.join(" · ")} ›`));
+    }
+    if (list.length === 0) rows.push(t.noMatch("(no matches)"));
     rows.push(truncateToWidth(t.description("type to filter · ↑↓ move · enter select · esc cancel"), w, "…"));
     return rows;
   }
 
-  invalidate(): void {
-    this.inner.invalidate();
-  }
+  invalidate(): void {}
 }
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

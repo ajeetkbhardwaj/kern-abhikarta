@@ -128,7 +128,9 @@ Type a task, or /help for commands.
 - **Enter** sends. **Shift+Enter** (or Alt+Enter) inserts a newline.
 - **Tab** accepts ghost-text completion (slash commands, `@files`).
 - **Type `/`** to see commands, **type `@`** to attach a file — the editor
-  completes paths from your workspace. Attached files are inlined into the
+  completes paths from your workspace (file search uses the `fd` binary
+  when present on `PATH`; slash-command completion always works). Attached
+  files are inlined into the
   prompt (`@src/auth.ts` → full contents, 40 KB cap each).
 - **Type `!`** to run a shell command directly (`! npm test`): output
   prints immediately *and* the agent responds to it.
