@@ -27,12 +27,14 @@ import type { AgentSession } from "@kern/coding-agent";
 import type { SessionManager } from "@kern/session-store";
 import { createAdapterFor, discoverModels, loadModelsFile, readLastUsed, recordLastUsed, resolveApiKey, saveAuthKey, saveProviderToUserFile, testProvider, PROVIDER_PRESETS, type ModelsFile, type ProviderConfig } from "@kern/model";
 import {
-  TuiMainScreen,
+  TuiAltScreen,
   ProcessTerminal,
   Editor,
   SelectList,
   Markdown,
   Loader,
+  ScrollView,
+  VStack,
   matchesKey,
   type Component,
   type OverlayHandle,
@@ -111,7 +113,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   }
   const cwd = resolve(options.cwd);
 
-  const tui = new TuiMainScreen(new ProcessTerminal());
+  const tui = new TuiAltScreen(new ProcessTerminal());
   const transcript = new Container();
   const statusBar = new StatusBar();
   const editor = new Editor(tui, buildEditorTheme(), { autocompleteMaxVisible: 8 });
@@ -176,11 +178,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
   const renderQueue = () => tui.requestRender();
 
-  tui.addChild(transcript);
-  tui.addChild(statusBar);
-  tui.addChild(toastLine);
-  tui.addChild(queuePanel);
-  tui.addChild(editor);
+  // Pi-style fullscreen dock: scrollable transcript on top, prompt +
+  // status pinned to the viewport bottom (editor never floats mid-screen).
+  const scrollTranscript = new ScrollView(transcript, { follow: "end", primary: true });
+  const dock = new VStack([
+    { component: queuePanel, shrink: 1, minSize: 0 },
+    { component: toastLine, shrink: 1, minSize: 0 },
+    { component: editor, shrink: 1, minSize: 3 },
+    { component: statusBar, shrink: 1, minSize: 0 },
+  ]);
+  tui.setLayoutRoot(
+    new VStack([
+      { component: scrollTranscript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+      { component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+    ]),
+  );
   tui.setFocus(editor);
 
   const say = (text: string) => {
@@ -1307,9 +1319,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     abort?.abort();
     options.approvalHook.current = null;
     unsubscribe?.();
-    say(theme.muted("bye."));
-    tui.renderNow();
     tui.stop();
+    // Fullscreen alt-screen restores the previous screen on stop, so the
+    // farewell must go to stdout after (it would vanish otherwise).
+    process.stdout.write(theme.muted("bye.\n"));
     process.exit(0);
   };
 
