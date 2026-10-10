@@ -1,6 +1,6 @@
 import { createAgentSession } from "@kern/coding-agent";
 import { createLogger } from "@kern/protocol";
-import { discoverModels, loadModelsFile, createAdapterFor } from "@kern/model";
+import { discoverModels, loadModelsFile, createAdapterFor, createModelRuntime } from "@kern/model";
 import { createInterface } from "node:readline";
 
 interface CliFlags {
@@ -119,20 +119,10 @@ async function main() {
   model ??= file.defaultModel;
   let adapter = undefined;
   if (providerName && model) {
-    adapter = await createAdapterFor(file, providerName, model, { baseUrl, apiKey }, logger);
+    adapter = await createModelRuntime(file, { provider: providerName, model, baseUrl, apiKey }, logger);
     process.stderr.write(`[model ${providerName}/${model}]\n`);
   } else if (baseUrl && model) {
-    // Ad-hoc OpenAI-compatible endpoint with no models.json entry.
-    const { createOpenAIAdapter } = await import("@kern/model");
-    adapter = createOpenAIAdapter({
-      provider: providerName ?? "custom",
-      modelId: model,
-      baseUrl,
-      apiKey,
-      contextWindow: 128_000,
-      maxOutputTokens: 4_000,
-      logger,
-    });
+    adapter = await createModelRuntime(file, { model, baseUrl, apiKey }, logger);
     process.stderr.write(`[model ${providerName ?? "custom"}/${model} @ ${baseUrl}]\n`);
   }
   const sessionOptions = {

@@ -1,5 +1,17 @@
 import { createLogger, newId, now, type Logger } from "@kern/protocol";
-import type { SessionEntry, MessageEntry, CompactionEntry, DiagnosticEntry, LabelEntry, BranchEntry, ExtensionEntry, ModelChangeEntry, ChatMessage } from "@kern/protocol";
+import type {
+  SessionEntry,
+  MessageEntry,
+  CompactionEntry,
+  DiagnosticEntry,
+  LabelEntry,
+  BranchEntry,
+  BranchSummaryEntry,
+  SessionNameEntry,
+  ExtensionEntry,
+  ModelChangeEntry,
+  ChatMessage,
+} from "@kern/protocol";
 import { isMessageEntry, isCompactionEntry } from "@kern/protocol";
 import type { SessionStore, SessionFile } from "./jsonl-store.js";
 
@@ -20,12 +32,14 @@ export interface LoadResult {
 export class SessionManager {
   private readonly store: SessionStore;
   private readonly logger: Logger;
+  private readonly cwd: string;
   private state: SessionState | null = null;
   private filePath: string | null = null;
 
-  constructor(store: SessionStore, logger: Logger = createLogger("info")) {
+  constructor(store: SessionStore, logger: Logger = createLogger("info"), cwd = process.cwd()) {
     this.store = store;
     this.logger = logger;
+    this.cwd = cwd;
   }
 
   static async create(store: SessionStore, cwd: string, meta?: Record<string, unknown>): Promise<SessionManager> {
@@ -43,7 +57,7 @@ export class SessionManager {
   }
 
   static async resume(store: SessionStore, cwd: string, sessionFile?: string): Promise<SessionManager> {
-    const mgr = new SessionManager(store, store["logger"] as Logger ?? createLogger("info"));
+    const mgr = new SessionManager(store, store["logger"] as Logger ?? createLogger("info"), cwd);
     let file: SessionFile | null = null;
     if (sessionFile) {
       file = { filePath: sessionFile, sessionId: "", createdAt: now(), mtimeMs: 0, size: 0 };
@@ -105,6 +119,10 @@ export class SessionManager {
     return header && header.type === "session_header" ? header.sessionId : null;
   }
 
+  get sessionName(): string | null {
+    return this.getSessionName();
+  }
+
   getEntry(id: string): SessionEntry | undefined {
     if (!this.state) throw new Error("SessionManager not initialized");
     return this.state.entries.get(id);
@@ -134,6 +152,14 @@ export class SessionManager {
     for (let i = path.length - 1; i >= 0; i--) {
       const e = path[i];
       if (e && isCompactionEntry(e)) return e;
+    }
+    return null;
+  }
+
+  getSessionName(): string | null {
+    if (!this.state) return null;
+    for (const entry of this.getActivePath().slice().reverse()) {
+      if (entry.type === "session_name") return entry.name;
     }
     return null;
   }
@@ -209,6 +235,45 @@ export class SessionManager {
     return entry;
   }
 
+  async appendBranch(note?: string): Promise<BranchEntry> {
+    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+    const forkedFromId = this.state.activeLeafId;
+    const entry: BranchEntry = { id: newId("b"), parentId: forkedFromId, timestamp: now(), type: "branch", forkedFromId, note, seq: this.nextSeq() };
+    await this.store.append(this.filePath, entry);
+    this.state.entries.set(entry.id, entry);
+    const arr = this.state.children.get(forkedFromId) ?? [];
+    arr.push(entry.id);
+    this.state.children.set(forkedFromId, arr);
+    this.state.activeLeafId = entry.id;
+    return entry;
+  }
+
+  async appendBranchSummary(fromId: string, summary: string): Promise<BranchSummaryEntry> {
+    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+    const parentId = this.state.activeLeafId;
+    const entry: BranchSummaryEntry = { id: newId("bs"), parentId, timestamp: now(), type: "branch_summary", fromId, summary, seq: this.nextSeq() };
+    await this.store.append(this.filePath, entry);
+    this.state.entries.set(entry.id, entry);
+    const arr = this.state.children.get(parentId) ?? [];
+    arr.push(entry.id);
+    this.state.children.set(parentId, arr);
+    this.state.activeLeafId = entry.id;
+    return entry;
+  }
+
+  async setSessionName(name: string): Promise<SessionNameEntry> {
+    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
+    const parentId = this.state.activeLeafId;
+    const entry: SessionNameEntry = { id: newId("n"), parentId, timestamp: now(), type: "session_name", name, seq: this.nextSeq() };
+    await this.store.append(this.filePath, entry);
+    this.state.entries.set(entry.id, entry);
+    const arr = this.state.children.get(parentId) ?? [];
+    arr.push(entry.id);
+    this.state.children.set(parentId, arr);
+    this.state.activeLeafId = entry.id;
+    return entry;
+  }
+
   async appendDiagnostic(d: Omit<DiagnosticEntry, "id" | "parentId" | "timestamp" | "type" | "seq">): Promise<DiagnosticEntry> {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
@@ -222,16 +287,20 @@ export class SessionManager {
     return entry;
   }
 
-  async appendBranch(note?: string): Promise<BranchEntry> {
-    if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
-    const forkedFromId = this.state.activeLeafId;
-    const entry: BranchEntry = { id: newId("b"), parentId: forkedFromId, timestamp: now(), type: "branch", forkedFromId, note, seq: this.nextSeq() };
-    await this.store.append(this.filePath, entry);
-    this.state.entries.set(entry.id, entry);
-    const arr = this.state.children.get(forkedFromId) ?? [];
-    arr.push(entry.id);
-    this.state.children.set(forkedFromId, arr);
-    this.state.activeLeafId = entry.id;
-    return entry;
+  async deleteSession(filePath: string): Promise<boolean> {
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async listSessions(limit = 20): Promise<string[]> {
+    const store = this.store;
+    const cwd = this.cwd || process.cwd();
+    const files = await store.listSessions(cwd, { limit });
+    return files.map((file) => file.filePath);
   }
 }

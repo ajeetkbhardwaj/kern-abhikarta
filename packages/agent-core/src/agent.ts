@@ -12,6 +12,7 @@ import type {
   ToolCallBlock,
   ModelErrorKind,
   CompactionPhase,
+  ThinkingLevel,
 } from "@kern/protocol";
 import type { ContextUsage } from "./tokens.js";
 import {
@@ -35,12 +36,17 @@ export interface AgentRuntimeOptions {
   budgets?: Partial<BudgetLimits>;
   compactor?: Compactor | null;
   retry?: RetryConfig;
+  defaultThinkingLevel?: ThinkingLevel;
   /** Called when policy demands approval. Absent = deny. */
   requestApproval?: (prompt: string, meta?: import("@kern/tools").ApprovalMeta) => Promise<boolean | "session">;
 }
 
 export interface RunTurnOptions {
   signal?: AbortSignal;
+  /** Queue this prompt after the current turn+tools complete. */
+  steer?: boolean;
+  /** Queue this prompt after the entire current run completes. */
+  followUp?: boolean;
 }
 
 export class AgentRuntime {
@@ -57,6 +63,10 @@ export class AgentRuntime {
   private busy = false;
   private turn = 0;
   private lastUsage: ContextUsage | null = null;
+  private disposed = false;
+  private activeAbortController: AbortController | null = null;
+  private queuedTurns: Array<{ text: string; opts: RunTurnOptions }> = [];
+  private thinkingLevel: ThinkingLevel;
 
   constructor(options: AgentRuntimeOptions) {
     this.model = options.model;
@@ -68,6 +78,7 @@ export class AgentRuntime {
     this.budgets = new BudgetTracker(options.budgets ?? {});
     this.compactor = options.compactor === undefined ? new Compactor({ logger: this.logger }) : options.compactor;
     this.retry = options.retry ?? DEFAULT_RETRY_CONFIG;
+    this.thinkingLevel = options.defaultThinkingLevel ?? "medium";
     if (options.requestApproval !== undefined) this.requestApproval = options.requestApproval;
   }
 
@@ -110,8 +121,21 @@ export class AgentRuntime {
     return this.busy;
   }
 
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
   modelInfo(): ModelInfo {
     return this.model.info;
+  }
+
+  thinkingMode(): ThinkingLevel {
+    return this.thinkingLevel;
+  }
+
+  async setThinkingLevel(level: ThinkingLevel): Promise<void> {
+    this.thinkingLevel = level;
+    await this.sessions.appendModelChange(this.model.info.provider, this.model.info.modelId, level);
   }
 
   /** Switch adapter mid-session. Records a model_change entry. Fails while busy. */
@@ -122,13 +146,28 @@ export class AgentRuntime {
     this.logger.info("model_changed", { provider: adapter.info.provider, model: adapter.info.modelId });
   }
 
+  dispose(): void {
+    this.disposed = true;
+    this.queuedTurns = [];
+    this.activeAbortController?.abort();
+    this.activeAbortController = null;
+    this.events.clear();
+  }
+
   async runUserTurn(userText: string, opts: RunTurnOptions = {}): Promise<void> {
-    if (this.busy) throw new Error("A turn is already running; wait for agent_settled");
-    const signal = opts.signal;
-    this.throwIfAborted(signal);
+    if (this.disposed) throw new Error("Session runtime has been disposed");
+    if (this.busy) {
+      if (opts.steer || opts.followUp) {
+        this.queuedTurns.push({ text: userText, opts });
+        return;
+      }
+      throw new Error("A turn is already running; pass { steer: true } or { followUp: true } to queue it.");
+    }
     this.busy = true;
     this.events.emit({ type: "agent_start" });
     this.turn = 0;
+    this.activeAbortController = opts.signal ? null : new AbortController();
+    const signal = opts.signal ?? this.activeAbortController?.signal;
     try {
       await this.sessions.appendUserMessage(userText);
       await this.ensureCompactIfNeeded("before_prompt", signal);
@@ -146,6 +185,7 @@ export class AgentRuntime {
           messages: ctx.messages,
           tools: ctx.tools,
           maxOutputTokens: this.model.info.maxOutputTokens,
+          thinkingLevel: this.thinkingLevel,
           signal,
         };
         const assistant = await this.streamModel(request, signal);
@@ -157,6 +197,7 @@ export class AgentRuntime {
           this.events.emit({ type: "agent_end", reason: "final_response" });
           await this.ensureCompactIfNeeded("after_agent_end", signal);
           this.events.emit({ type: "agent_settled" });
+          await this.flushQueuedTurn();
           return;
         }
         this.budgets.checkToolBatch(toolCalls.length);
@@ -177,6 +218,7 @@ export class AgentRuntime {
         });
         this.events.emit({ type: "agent_end", reason: "aborted" });
         this.events.emit({ type: "agent_settled" });
+        await this.flushQueuedTurn();
         return;
       }
       const serialized = serializeError(error);
@@ -188,10 +230,18 @@ export class AgentRuntime {
       });
       this.events.emit({ type: "agent_error", error: serialized });
       this.events.emit({ type: "agent_settled" });
+      await this.flushQueuedTurn();
       throw error;
     } finally {
       this.busy = false;
+      this.activeAbortController = null;
     }
+  }
+
+  private async flushQueuedTurn(): Promise<void> {
+    const next = this.queuedTurns.shift();
+    if (!next) return;
+    await this.runUserTurn(next.text, next.opts);
   }
 
   /**
@@ -279,10 +329,12 @@ export class AgentRuntime {
         onRetry: (attempt, kind, delayMs) => {
           this.events.emit({ type: "auto_retry_start", attempt, reason: kind, delayMs });
         },
-        onSettled: (attempt, success) => {
-          if (!success) return;
-          // Only emit the end marker if at least one retry happened.
-          if (attempt > 1) this.events.emit({ type: "auto_retry_end", attempt, success });
+        onSettled: (attempt, success, kind) => {
+          if (!success) {
+            this.events.emit({ type: "auto_retry_end", attempt, success, reason: kind ?? "unknown" });
+            return;
+          }
+          if (attempt > 1) this.events.emit({ type: "auto_retry_end", attempt, success, reason: kind ?? "success" });
         },
       },
     );

@@ -132,6 +132,19 @@ export const BranchEntrySchema = BaseEntrySchema.extend({
   note: z.string().optional(),
 });
 
+/** Branch summary */
+export const BranchSummaryEntrySchema = BaseEntrySchema.extend({
+  type: z.literal("branch_summary"),
+  fromId: z.string(),
+  summary: z.string(),
+});
+
+/** Session naming */
+export const SessionNameEntrySchema = BaseEntrySchema.extend({
+  type: z.literal("session_name"),
+  name: z.string(),
+});
+
 /** Extension entry */
 export const ExtensionEntrySchema = BaseEntrySchema.extend({
   type: z.literal("extension"),
@@ -182,6 +195,8 @@ export const SessionEntrySchema = z.discriminatedUnion("type", [
   ModelChangeEntrySchema,
   LabelEntrySchema,
   BranchEntrySchema,
+  BranchSummaryEntrySchema,
+  SessionNameEntrySchema,
   ExtensionEntrySchema,
   DiagnosticEntrySchema,
 ]);

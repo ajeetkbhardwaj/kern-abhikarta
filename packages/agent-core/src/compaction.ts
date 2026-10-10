@@ -51,6 +51,14 @@ export interface CompactionDecision {
   reason: string;
   totalTokens: number;
   budgetTokens: number;
+  weakSummary?: boolean;
+}
+
+export interface CompactionQuality {
+  isWeak: boolean;
+  reason: string;
+  minimumWords: number;
+  observedWords: number;
 }
 
 export interface CompactorOptions {
@@ -70,11 +78,13 @@ export class Compactor {
   private readonly logger: Logger;
   private readonly threshold: number;
   private readonly outputReserve: number;
+  private readonly minimumSummaryWords: number;
 
   constructor(options: CompactorOptions = {}) {
     this.logger = options.logger ?? nullLogger;
     this.threshold = options.threshold ?? 0.75;
     this.outputReserve = options.outputReserve ?? 4000;
+    this.minimumSummaryWords = 24;
   }
 
   /**
@@ -94,6 +104,18 @@ export class Compactor {
       };
     }
     return { shouldCompact: false, reason: "within budget", totalTokens, budgetTokens };
+  }
+
+  assessSummaryQuality(summary: string): CompactionQuality {
+    const normalized = summary.trim();
+    const words = normalized ? normalized.split(/\s+/).filter(Boolean).length : 0;
+    const weak = words < this.minimumSummaryWords || normalized.length < 120;
+    return {
+      isWeak: weak,
+      reason: weak ? `summary is too weak: ${words} words / ${normalized.length} chars` : "summary has sufficient detail",
+      minimumWords: this.minimumSummaryWords,
+      observedWords: words,
+    };
   }
 
   /**
@@ -143,7 +165,11 @@ export class Compactor {
     if (!summary) {
       throw new Error("Compaction produced an empty summary");
     }
-    this.logger.info("compacted", { replacesThroughId, summaryChars: summary.length });
+    const quality = this.assessSummaryQuality(summary);
+    if (quality.isWeak) {
+      throw new Error(`Compaction produced a weak summary: ${quality.reason}`);
+    }
+    this.logger.info("compacted", { replacesThroughId, summaryChars: summary.length, quality: quality.reason });
     return { summary, replacesThroughId };
   }
 }

@@ -522,3 +522,32 @@ export async function createAdapterFor(
     logger,
   });
 }
+
+export async function createModelRuntime(
+  file: ModelsFile,
+  input: SelectionInput = {},
+  logger: Logger = nullLogger,
+): Promise<ModelAdapter> {
+  const providerName = input.provider ?? file.defaultProvider;
+  const modelId = input.model ?? file.defaultModel;
+
+  if (providerName && modelId) {
+    return createAdapterFor(file, providerName, modelId, input, logger);
+  }
+
+  if (input.baseUrl && modelId) {
+    const provider = providerName ?? "custom";
+    const key = await resolveApiKey(provider, { baseUrl: input.baseUrl }, input.apiKey);
+    return createOpenAIAdapter({
+      provider,
+      modelId,
+      baseUrl: input.baseUrl,
+      apiKey: key,
+      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      maxOutputTokens: DEFAULT_MAX_OUTPUT,
+      logger,
+    });
+  }
+
+  throw new KernError("E_MODEL_REQUEST", "No model selected. Provide --provider/--model or a baseUrl + model.");
+}

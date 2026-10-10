@@ -23,6 +23,8 @@ export interface ModelToolSchema {
   inputSchema: JsonSchema;
 }
 
+export type ThinkingLevel = "off" | "low" | "medium" | "high";
+
 export interface ModelRequest {
   /** Assembled once per context build; providers that lack a system role prepend it. */
   systemPrompt: string;
@@ -31,7 +33,7 @@ export interface ModelRequest {
   maxOutputTokens?: number;
   temperature?: number;
   /** Optional thinking/reasoning budget for providers that support it. */
-  thinkingLevel?: "off" | "low" | "medium" | "high";
+  thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
 }
 
