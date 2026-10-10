@@ -83,7 +83,9 @@ export class StatusBar implements Component {
 	render(width: number): string[] {
 		const w = Math.max(0, width);
 		if (this.segments.length === 0) return [""];
-		return [truncateToWidth(this.segments.join(theme.muted(" │ ")), w, "")];
+		const joined = this.segments.join(theme.muted(" │ "));
+		const padded = ` ${joined} `;
+		return [truncateToWidth(theme.muted("▏") + padded, w, "")];
 	}
 }
 
@@ -102,7 +104,7 @@ export class ToolCard implements Component {
 	}
 
 	appendOutput(text: string): void {
-		for (const line of text.split("\n")) this.outputs.push(line);
+		for (const line of text.split("\n")) this.outputs.push(line.trimEnd());
 	}
 
 	finish(failed = false): void {
@@ -128,11 +130,14 @@ export class ToolCard implements Component {
 		else if (this.failed) header = theme.error(`✖ ${summary}`);
 		else header = `${theme.success("✔")} ${theme.bold(summary)}`;
 		const rows = [truncateToWidth(header, w, "")];
-		for (const line of this.outputs.slice(Math.max(0, this.outputs.length - this.maxLines))) {
-			rows.push(truncateToWidth(theme.tool(line), w, ""));
+		const visible = this.outputs.slice(Math.max(0, this.outputs.length - this.maxLines));
+		for (const line of visible) {
+			const compact = line.trim();
+			if (!compact) continue;
+			rows.push(truncateToWidth(theme.tool(`  ▸ ${compact}`), w, ""));
 		}
 		if (this.failed && this.outputs.length === 0) {
-			rows.push(truncateToWidth(theme.error("failed with no output"), w, ""));
+			rows.push(truncateToWidth(theme.error("  ▸ failed with no output"), w, ""));
 		}
 		return rows;
 	}

@@ -13,6 +13,10 @@
     "@kern/model": "workspace:*",
     "@kern/session-store": "workspace:*",
     "@kern/tools": "workspace:*",
-    "@kern/agent-core": "workspace:*"
+    "@kern/agent-core": "workspace:*",
+    "@kern/repo-index": "workspace:*",
+    "@kern/symbol-store": "workspace:*",
+    "@kern/semantic-search": "workspace:*",
+    "@kern/project-memory": "workspace:*"
   }
 }

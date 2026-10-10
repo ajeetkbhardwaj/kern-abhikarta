@@ -160,17 +160,35 @@ importers:
       '@kern/model':
         specifier: workspace:*
         version: link:../model
+      '@kern/project-memory':
+        specifier: workspace:*
+        version: link:../project-memory
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@kern/repo-index':
+        specifier: workspace:*
+        version: link:../repo-index
+      '@kern/semantic-search':
+        specifier: workspace:*
+        version: link:../semantic-search
       '@kern/session-store':
         specifier: workspace:*
         version: link:../session-store
+      '@kern/symbol-store':
+        specifier: workspace:*
+        version: link:../symbol-store
       '@kern/tools':
         specifier: workspace:*
         version: link:../tools
 
   packages/model:
+    dependencies:
+      '@kern/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/project-memory:
     dependencies:
       '@kern/protocol':
         specifier: workspace:*
@@ -182,11 +200,38 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
 
+  packages/repo-index:
+    dependencies:
+      '@kern/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/semantic-search:
+    dependencies:
+      '@kern/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@kern/repo-index':
+        specifier: workspace:*
+        version: link:../repo-index
+      '@kern/symbol-store':
+        specifier: workspace:*
+        version: link:../symbol-store
+
   packages/session-store:
     dependencies:
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol
+
+  packages/symbol-store:
+    dependencies:
+      '@kern/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@kern/repo-index':
+        specifier: workspace:*
+        version: link:../repo-index
 
   packages/tools:
     dependencies:

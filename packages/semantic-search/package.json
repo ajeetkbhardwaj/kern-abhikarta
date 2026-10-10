@@ -1,0 +1,16 @@
+{
+  "name": "@kern/semantic-search",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Repo-aware retrieval and ranking for task-specific file selection.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@kern/repo-index": "workspace:*",
+    "@kern/symbol-store": "workspace:*",
+    "@kern/protocol": "workspace:*"
+  }
+}

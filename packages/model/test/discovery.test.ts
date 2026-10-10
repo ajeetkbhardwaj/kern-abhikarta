@@ -17,6 +17,7 @@ import {
   testProvider,
   userModelsFile,
 } from "../src/discovery.js";
+import { createOpenAIAdapter } from "../src/openai.js";
 
 let savedHome: string | undefined;
 let home: string;
@@ -193,5 +194,54 @@ describe("discoverModels filtering", () => {
   it("no filters returns union without dupes", async () => {
     const out = await discoverModels(file, { provider: "p" }, { fetchImpl: live });
     expect(out.map((m) => m.id).sort()).toEqual(["m1", "m2", "m3"]);
+  });
+});
+
+describe("openai adapter", () => {
+  it("normalizes streaming text and tool calls", async () => {
+    const calls: Array<{ body: string; headers?: Record<string, string> }> = [];
+    const adapter = createOpenAIAdapter({
+      provider: "test",
+      modelId: "gpt-4o-mini",
+      baseUrl: "https://example.com/v1",
+      apiKey: "k",
+      contextWindow: 128000,
+      maxOutputTokens: 4000,
+      fetchImpl: (async (url, init) => {
+        calls.push({
+          body: String((init as any)?.body ?? ""),
+          headers: (init as any)?.headers as Record<string, string> | undefined,
+        });
+        const payload = `data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n` +
+          `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\\"q\\":\\"x\\"}"}}]},"finish_reason":null}] }\n\n` +
+          `data: [DONE]\n\n`;
+        return {
+          ok: true,
+          status: 200,
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(payload));
+              controller.close();
+            },
+          }),
+        } as any;
+      }) as typeof fetch,
+    });
+
+    const events: any[] = [];
+    for await (const event of adapter.stream({
+      systemPrompt: "sys",
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: new Date().toISOString() }],
+      tools: [{ name: "lookup", description: "lookup", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } }],
+      thinkingLevel: "medium",
+    })) {
+      events.push(event);
+    }
+
+    expect(events.some((e) => e.type === "text_delta" && e.delta === "hello")).toBe(true);
+    expect(events.some((e) => e.type === "tool_call_complete")).toBe(true);
+    expect(calls.length).toBeGreaterThan(0);
+    const body = JSON.parse(calls[0]!.body);
+    expect(body.reasoning_effort).toBe("medium");
   });
 });

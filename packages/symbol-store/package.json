@@ -1,0 +1,15 @@
+{
+  "name": "@kern/symbol-store",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight symbol extraction and lookup for TypeScript projects.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@kern/repo-index": "workspace:*",
+    "@kern/protocol": "workspace:*"
+  }
+}

@@ -122,6 +122,19 @@ export interface BranchEntry extends BaseEntry {
   note?: string;
 }
 
+export interface BranchSummaryEntry extends BaseEntry {
+  type: "branch_summary";
+  /** The branch being abandoned. */
+  fromId: string;
+  /** Human-readable summary of the abandoned path. */
+  summary: string;
+}
+
+export interface SessionNameEntry extends BaseEntry {
+  type: "session_name";
+  name: string;
+}
+
 export interface ExtensionEntry extends BaseEntry {
   type: "extension";
   extensionName: string;
@@ -144,6 +157,8 @@ export type SessionEntry =
   | ModelChangeEntry
   | LabelEntry
   | BranchEntry
+  | BranchSummaryEntry
+  | SessionNameEntry
   | ExtensionEntry
   | DiagnosticEntry;
 
@@ -178,6 +193,14 @@ export function isMessageEntry(entry: SessionEntry): entry is MessageEntry {
 
 export function isCompactionEntry(entry: SessionEntry): entry is CompactionEntry {
   return entry.type === "compaction";
+}
+
+export function isBranchSummaryEntry(entry: SessionEntry): entry is BranchSummaryEntry {
+  return entry.type === "branch_summary";
+}
+
+export function isSessionNameEntry(entry: SessionEntry): entry is SessionNameEntry {
+  return entry.type === "session_name";
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +242,7 @@ export type AgentEvent =
   | { type: "auto_compaction_start"; phase: CompactionPhase }
   | { type: "auto_compaction_end"; summary: string; replacedThroughId: string }
   | { type: "auto_retry_start"; attempt: number; reason: string; delayMs: number }
-  | { type: "auto_retry_end"; attempt: number; success: boolean }
+  | { type: "auto_retry_end"; attempt: number; success: boolean; reason?: string }
   | { type: "agent_start" }
   | { type: "agent_end"; reason: "final_response" | "aborted" | "queued_work_remaining" }
   | { type: "agent_error"; error: SerializedError }
@@ -263,10 +286,29 @@ const RETRYABLE_MODEL_KINDS: ReadonlySet<ModelErrorKind> = new Set([
   "timeout",
   "network",
   "overloaded",
+  "invalid_request",
+  "malformed_response",
 ]);
 
 export function isRetryableModelError(kind: ModelErrorKind): boolean {
   return RETRYABLE_MODEL_KINDS.has(kind);
+}
+
+export function classifyModelError(error: unknown): ModelErrorKind {
+  if (error instanceof KernError && error.kind) return error.kind;
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    if (/unauthorized|forbidden|401|invalid api key|auth/i.test(message)) return "auth";
+    if (/429|rate limit|too many requests/i.test(message)) return "rate_limit";
+    if (/timeout|timed out|econnreset|esockettimedout|deadline exceeded/i.test(message)) return "timeout";
+    if (/network|fetch failed|econnrefused|enotfound|socket hang up|dns|reset by peer|connection refused/i.test(message)) return "network";
+    if (/overloaded|temporarily unavailable|service unavailable|bad gateway|gateway timeout|503|504/i.test(message)) return "overloaded";
+    if (/context.*(length|window)|token.*limit|maximum context|too many tokens/i.test(message)) return "context_length";
+    if (/invalid request|400|bad request|malformed.*request|unsupported.*parameter/i.test(message)) return "invalid_request";
+    if (/malformed|parse.*json|unexpected token|invalid json|response.*format/i.test(message)) return "malformed_response";
+    if (/abort|cancelled|aborted/i.test(message)) return "cancelled";
+  }
+  return "unknown";
 }
 
 const DIAGNOSTIC_BY_MODEL_KIND: Record<ModelErrorKind, DiagnosticCode> = {

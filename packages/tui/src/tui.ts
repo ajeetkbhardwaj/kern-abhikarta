@@ -59,21 +59,27 @@ export interface InteractiveOptions {
 }
 
 const COMMANDS = [
-  { name: "help", description: "show this list" },
-  { name: "model", description: "pick provider/model (auto-listed)" },
-  { name: "models", description: "alias for /model" },
-  { name: "keys", description: "re-auth the current provider" },
-  { name: "connect", description: "connect a provider (key or local URL)" },
-  { name: "compact", description: "summarize history into a checkpoint" },
-  { name: "diff", description: "show working-tree changes" },
+  { name: "help", description: "show the command list" },
+  { name: "name", description: "name the current session" },
+  { name: "model", description: "pick provider/model" },
+  { name: "switch", description: "switch sessions" },
+  { name: "connect", description: "connect or re-auth a provider" },
   { name: "new", description: "start a fresh session" },
-  { name: "export", description: "dump transcript to markdown" },
-  { name: "budget", description: "show turn/call/time usage" },
-  { name: "clear", description: "clear the screen" },
+  { name: "export", description: "export the transcript" },
+  { name: "clear", description: "clear the transcript" },
   { name: "quit", description: "exit the session" },
 ];
 
+const ADVANCED_COMMANDS = {
+  compact: "summarize history into a checkpoint",
+  diff: "show working-tree changes",
+  budget: "show usage and timing",
+  keys: "re-auth the current provider",
+  branch: "record a branch summary",
+};
+
 const HINTS = "Enter send · Shift+Enter newline · Tab complete · @ files · ! shell · Ctrl+C abort";
+const QUICK_HELP = "Quick actions: /model · /switch · /connect · /new · /help";
 const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
@@ -221,15 +227,68 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
 
   const printHeader = () => {
     const m = session.modelInfo();
+    const name = session.sessionName() ? `  ·  ${session.sessionName()}` : "";
     const head = new Box(
-      new Text(`${theme.bold("kern")}  ${m.provider}/${m.modelId}  ·  ${modeLabel()}  ·  ${cwd}`, 1, 0),
-      { title: "kern" },
+      new Text(`${theme.bold("kern")}  ${m.provider}/${m.modelId}${name}  ·  ${modeLabel()}  ·  ${cwd}`, 1, 0),
+      { title: "session", mood: "info" },
     );
     transcript.addChild(head);
     info("Type a task, or /help for commands.");
     info(HINTS);
+    info(theme.muted(QUICK_HELP));
     transcript.addChild(new Rule());
     tui.requestRender();
+  };
+
+  const renameSession = async () => {
+    const current = session.sessionName();
+    const next = await promptText("session name", current ?? "");
+    if (next === null) {
+      toast("Session rename cancelled.");
+      return;
+    }
+    const value = next.trim();
+    if (!value) {
+      toast("Session name was empty.");
+      return;
+    }
+    try {
+      const name = await session.setSessionName?.(value);
+      if (name) {
+        toast(`Session renamed to ${name}.`);
+        printHeader();
+      }
+    } catch (error) {
+      err(`Rename failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const recordBranchSummary = async () => {
+    const note = await promptText("branch summary", "");
+    if (note === null) {
+      toast("Branch summary cancelled.");
+      return;
+    }
+    const value = note.trim();
+    if (!value) {
+      toast("Branch summary was empty.");
+      return;
+    }
+    const fromId = session.activeLeafId?.();
+    if (!fromId) {
+      toast("No active branch to summarize yet.");
+      return;
+    }
+    try {
+      const summary = await session.branchSummary?.(fromId, value);
+      if (summary) {
+        toast(`Branch saved: ${summary.slice(0, 80)}${summary.length > 80 ? "…" : ""}`);
+      } else {
+        toast("Branch summary saved.");
+      }
+    } catch (error) {
+      err(`Branch summary failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   const printStatus = () => {
@@ -237,8 +296,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const m = session.modelInfo();
     const usage = session.contextUsage();
     const ctx = usage ? `ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "ctx —";
+    const sessionName = session.sessionName() ? ` · ${session.sessionName()}` : "";
     statusBar.setSegments([
-      `${m.provider}/${m.modelId}`,
+      `${m.provider}/${m.modelId}${sessionName}`,
       modeLabel(),
       ctx,
       `${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s`,
@@ -249,14 +309,53 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // --- event → transcript -----------------------------------------------------
   let md: Markdown | null = null;
   let mdText = "";
+  let reasoningText: Text | null = null;
+  let reasoningBuffer = "";
+  let turnNumber = 0;
   const cards = new Map<string, ToolCard>();
   const closeAssistant = () => {
     md = null;
     mdText = "";
   };
+  const closeReasoning = () => {
+    reasoningText = null;
+    reasoningBuffer = "";
+  };
+  const addTranscriptGap = () => {
+    transcript.addChild(new Spacer(1));
+    transcript.addChild(new Rule());
+    transcript.addChild(new Spacer(0));
+  };
+  const turnLabel = (kind: "user" | "assistant" | "reasoning" | "tool") => {
+    const label =
+      kind === "user" ? "user" : kind === "assistant" ? "assistant" : kind === "reasoning" ? "reasoning" : "tool";
+    return `${label.toUpperCase()} · turn ${turnNumber}`;
+  };
+
+  const renderUserPrompt = (text: string) => {
+    addTranscriptGap();
+    const body = new Text(`${theme.user("you")}\n${theme.muted(text)}`, 0, 0);
+    transcript.addChild(new Box(body, { title: turnLabel("user"), mood: "info" }));
+    tui.requestRender();
+  };
+  const renderAssistantBlock = () => {
+    if (md) return;
+    addTranscriptGap();
+    md = new Markdown("", 0, 0, buildMarkdownTheme());
+    transcript.addChild(new Box(md, { title: turnLabel("assistant"), mood: "accent" }));
+    tui.requestRender();
+  };
+  const renderReasoningBlock = () => {
+    if (reasoningText) return;
+    addTranscriptGap();
+    reasoningText = new Text("", 0, 0);
+    transcript.addChild(new Box(reasoningText, { title: turnLabel("reasoning"), mood: "info" }));
+    tui.requestRender();
+  };
 
   /** Persistent error card for auth failures; recovery choices follow via overlay. */
   const showAuthCard = (message: string) => {
+    addTranscriptGap();
     const body = new Text(
       `${theme.error("Auth failed — the model rejected our credentials.")}\n${theme.muted(message)}\n${theme.muted("Pick a fix in the dialog above (Esc dismisses). /keys re-auths, /model switches.")}`,
       0,
@@ -272,23 +371,24 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       if (exiting) return;
       switch (event.type) {
         case "text_delta":
-          if (!md) {
-            say(theme.bold("assistant"));
-            mdText = "";
-            md = new Markdown("", 0, 0, buildMarkdownTheme());
-            transcript.addChild(md);
-          }
+          renderAssistantBlock();
           mdText += event.delta;
-          md.setText(mdText);
+          md?.setText(mdText);
           tui.requestRender();
           break;
         case "reasoning_delta":
           activity = "thinking";
           if (loader) loader.setMessage("thinking");
+          renderReasoningBlock();
+          reasoningBuffer += event.delta;
+          reasoningText?.setText(theme.muted(reasoningBuffer));
+          tui.requestRender();
           break;
         case "message_end":
           closeAssistant();
+          closeReasoning();
           transcript.addChild(new Spacer(1));
+          transcript.addChild(new Rule());
           tui.requestRender();
           break;
         case "tool_execution_start": {
@@ -297,7 +397,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           if (loader) loader.setMessage(activity);
           const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
           cards.set(event.toolCallId, card);
-          transcript.addChild(new Box(card, {}));
+          addTranscriptGap();
+          transcript.addChild(new Box(card, { title: turnLabel("tool"), mood: "info" }));
           tui.requestRender();
           break;
         }
@@ -339,6 +440,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           break;
         case "agent_error":
           closeAssistant();
+          closeReasoning();
           err(`[error ${event.error.code}] ${event.error.message}`);
           if (event.error.code === "E_MODEL_AUTH") {
             showAuthCard(event.error.message);
@@ -347,6 +449,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           break;
         case "agent_settled":
           closeAssistant();
+          closeReasoning();
           break;
         default:
           break;
@@ -1054,10 +1157,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const runCommand = async (line: string): Promise<boolean> => {
     const [cmd, ...rest] = line.trim().split(/\s+/);
     const arg = rest.join(" ").trim();
-    switch (cmd) {
+    const normalized = cmd?.toLowerCase();
+    switch (normalized) {
       case "/help":
         for (const c of COMMANDS) say(`  ${theme.accent("/" + c.name)}  ${theme.muted(c.description)}`);
+        const advanced = Object.entries(ADVANCED_COMMANDS);
+        if (advanced.length > 0) {
+          info(theme.muted(`Advanced: ${advanced.map(([name, description]) => `/${name} (${description})`).join(" · ")}`));
+        }
         info(HINTS);
+        return true;
+      case "/name":
+        await renameSession();
+        return true;
+      case "/branch":
+        await recordBranchSummary();
         return true;
       case "/quit":
       case "/exit":
@@ -1073,6 +1187,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       case "/model":
       case "/models":
         await pickModel(arg || undefined);
+        return true;
+      case "/switch":
+      case "/session":
+      case "/sessions":
+        await sessionSwitcher();
         return true;
       case "/keys":
         await runReauth();
@@ -1169,8 +1288,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     activity = "thinking";
     lastUserPrompt = text;
     setBusy(true);
-    say(theme.bold("you"));
-    say(theme.muted(text));
+    turnNumber += 1;
+    renderUserPrompt(text);
     session
       .prompt(text, { signal: abort.signal })
       .catch((error: unknown) => {
@@ -1431,4 +1550,67 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       }
     }, 100);
   });
+
+  const sessionSwitcher = async (): Promise<void> => {
+    if (busy) {
+      toast("Wait for the current turn to settle before switching sessions.");
+      return;
+    }
+    try {
+      const items = await manager.listSessions?.() ?? [];
+      if (items.length === 0) {
+        toast("No saved sessions yet.");
+        return;
+      }
+      const list = new SelectList(
+        items.map((path) => ({
+          value: path,
+          label: path.split(/[\\/]/).at(-1) ?? path,
+          description: path,
+        })),
+        10,
+        buildSelectTheme(),
+      );
+      const body = new Container();
+      body.addChild(new Text(theme.bold("switch session"), 0, 0));
+      body.addChild(list);
+      const handle = showDialog(body, list);
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = (run: (() => Promise<void> | void) | null) => {
+          if (done) return;
+          done = true;
+          handle.hide();
+          tui.setFocus(editor);
+          void Promise.resolve(run?.()).finally(() => resolve());
+        };
+        list.onSelect = (item) => finish(async () => {
+          try {
+            const next = await session.switchSession?.(item.value);
+            if (!next) {
+              toast("Session switch is unavailable right now.");
+              return;
+            }
+            unsubscribe?.();
+            session = next.session;
+            manager = next.manager;
+            queue = [];
+            renderQueue();
+            subscribe();
+            transcript.clear();
+            printHeader();
+            printStatus();
+            toast("Session switched.");
+          } catch (error) {
+            err(`Session switch failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        });
+        list.onCancel = () => finish(null);
+      });
+    } catch (error) {
+      err(`Session list failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  return;
 }

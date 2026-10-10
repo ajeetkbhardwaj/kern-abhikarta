@@ -168,7 +168,7 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions): ModelAdapter
 }
 
 function toOpenAIBody(request: ModelRequest, options: OpenAIAdapterOptions): Record<string, unknown> {
-  return {
+  const body: Record<string, unknown> = {
     model: options.modelId,
     messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.map(toOpenAIMessage)],
     tools: request.tools.map(toOpenAITool),
@@ -178,6 +178,12 @@ function toOpenAIBody(request: ModelRequest, options: OpenAIAdapterOptions): Rec
     max_completion_tokens: request.maxOutputTokens ?? options.maxOutputTokens,
     temperature: request.temperature ?? options.temperature ?? 0.2,
   };
+
+  const wantsReasoning = request.thinkingLevel && request.thinkingLevel !== "off" && (options.supportsThinking ?? true);
+  if (wantsReasoning) {
+    body.reasoning_effort = request.thinkingLevel;
+  }
+  return body;
 }
 
 function toOpenAIMessage(message: ChatMessage): Record<string, unknown> {
@@ -313,6 +319,12 @@ function toKernError(error: unknown, status: number | undefined, options: OpenAI
   const message = error instanceof Error ? error.message : String(error);
   if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|fetch failed|network/i.test(message)) {
     return KernError.model("network", `Cannot reach ${options.baseUrl}: ${message}`);
+  }
+  if (status === 408) {
+    return KernError.model("timeout", `Request to provider ${options.provider} timed out (HTTP ${status})`, { status });
+  }
+  if (status === 413 || /context.*(too|long)|maximum.*context|token.*limit/i.test(message)) {
+    return KernError.model("context_length", `Context window exceeded for provider ${options.provider}`, { status });
   }
   return KernError.model("unknown", `Model call failed: ${message}`);
 }
