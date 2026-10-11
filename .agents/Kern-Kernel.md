@@ -419,6 +419,17 @@ never wrapped. Commands: `/help /model /models /keys /connect
 redraw, `Shift+Tab` approval mode, digits fill suggestions (never
 send). See `.agents/docs/08-tui.md` for the full flow reference.
 
+### TUI interaction model
+
+Kern's interactive UI is intentionally minimal and user-first:
+
+- The editor starts blank and remains user-owned; there is no forced suggestion overlay or canned prompt injection during a fresh session.
+- A small live activity row sits directly above the editor and rotates through states such as `thinking`, `writing response`, `running search`, and `ready`.
+- The prompt is visually calm and persistent: the user continues typing naturally while the agent indicates progress in-place without dominating the screen.
+- Escape aborts the active agent turn, while Ctrl+C and Ctrl+D preserve the standard safety shortcuts.
+
+This is deliberately different from older agent UIs that pre-fill the prompt or rely on a more chat-like “starter suggestions” flow. Kern keeps the work visible, but leaves direct user control and local agency intact.
+
 ---
 
 ## 13. Safety model

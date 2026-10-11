@@ -118,8 +118,14 @@ Print mode streams the answer to stdout, status to stderr (pipe-safe).
 
 ## 4. Interactive TUI tour
 
-```
-kern  ollama/qwen2.5-coder:7b  ·  manual  ·  /home/you/proj
+The Kern TUI is intentionally minimal and user-owned:
+
+- The editor starts blank — the user types their own task, without canned prompts or suggestion cards.
+- A compact live status row sits directly above the editor and shows a rotating spinner plus the current phase, for example: `thinking...`, `writing...`, `running search...`, `ready`.
+- While a turn is running, activity is visible without taking over the workspace or forcing the user into scripted prompts.
+
+```text
+⠦ thinking...
 Type a task, or /help for commands.
 ```
 
@@ -127,27 +133,18 @@ Type a task, or /help for commands.
 
 - **Enter** sends. **Shift+Enter** (or Alt+Enter) inserts a newline.
 - **Tab** accepts ghost-text completion (slash commands, `@files`).
-- **Type `/`** to see commands, **type `@`** to attach a file — the editor
-  completes paths from your workspace (file search uses the `fd` binary
-  when present on `PATH`; slash-command completion always works). Attached
-  files are inlined into the
-  prompt (`@src/auth.ts` → full contents, 40 KB cap each).
-- **Type `!`** to run a shell command directly (`! npm test`): output
-  prints immediately *and* the agent responds to it.
-- Standard readline keys: `Ctrl+A/E`, `Alt+B/F`, `Ctrl+W`, `Ctrl+K/U/Y`,
-  `Ctrl+S` stash/restore, `Ctrl+R` history search, `Ctrl+L` redraw.
-- While the agent works, anything you type is **queued** (cap 5) and sent
-  next — no need to wait. **Ctrl+C** aborts the turn (queued items still
-  send); **Esc** also aborts; **Ctrl+D twice** exits.
+- **Type `/`** to see commands, **type `@`** to attach a file — the editor completes paths from your workspace.
+- **Type `!`** to run a shell command directly (`! npm test`): output prints immediately *and* the agent responds to it.
+- Standard readline keys: `Ctrl+A/E`, `Alt+B/F`, `Ctrl+W`, `Ctrl+K/U/Y`, `Ctrl+S` stash/restore, `Ctrl+R` history search, `Ctrl+L` redraw.
+- While the agent works, anything you type is **queued** (cap 5) and sent next — no need to wait.
+- **Esc** stops the active run immediately; **Ctrl+C** also cancels the current turn; **Ctrl+D twice** exits.
 
 ### Assistant output
 
 - Replies render as Markdown with **syntax-highlighted code blocks**.
 - Tool activity shows as cards: `◈ bash` → `✔ bash done` / `✖ read failed`.
-- A spinner shows elapsed time and current activity (`running bash`,
-  `compacting context`, …).
-- The status line always shows
-  `model · mode · turns · calls · seconds · ctx %`.
+- The status row remains above the editor and reflects the active phase (`thinking`, `writing response`, `running search`, `ready`).
+- The header still shows `model · mode · turns · calls · seconds · ctx %`.
 
 ---
 
@@ -198,6 +195,37 @@ Kern **asks before acting**, mechanically — not via prompt wording:
   `~/.kern/agent/sessions/<project>/…jsonl` as a branchable tree.
   `pnpm kern --resume` continues the latest one; `/export` dumps any
   session to Markdown for sharing or review.
+
+---
+
+## 7b. MCP plugins (opt-in)
+
+Core stays minimal (`read/write/edit/bash` only). To connect an MCP
+server for a session, drop a file in the project — nothing else changes
+when no file exists. Editor-standard shapes, both accepted:
+
+```json
+// <project>/mcp.json  (or .mcp.json, or .vscode/mcp.json)
+{ "servers": { "ai-engineer": { "type": "http", "url": "https://ai.engineer/mcp" } } }
+{ "mcpServers": { "ai-engineer": { "url": "https://ai.engineer/mcp" } } }
+```
+
+Env overrides still work (`KERN_MCP_URL`, `KERN_MCP_COMMAND`); private
+servers belong in `~/.kern/mcp.json` (same shapes).
+
+Remote tools appear as `mcp__<name>`. Two generic tools ship alongside
+for any server: `mcp_inventory` (find the right tool/resource/prompt by
+query — use it first on big servers) and `mcp_read` (read a resource or
+get a prompt). Servers may also take `headers` (e.g. Authorization) in
+`mcp.json` — never logged. Safety follows the same rules
+you already know: `readOnlyHint` tools run like `read`; everything
+else pops the usual approval dialog (denied headless — the turn
+continues, it doesn't die). Trust rule: project files are untrusted, so
+stdio servers from a project `mcp.json` are refused with a warning
+(a cloned repo must not run local commands); put stdio in
+`~/.kern/mcp.json` or `KERN_MCP_COMMAND`. Servers are untrusted input like web
+content: responses are redacted and bounded before entering context.
+Subagents stay deferred — one turn loop, no hidden workers.
 
 ---
 

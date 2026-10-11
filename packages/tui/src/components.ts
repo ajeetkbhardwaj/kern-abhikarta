@@ -104,7 +104,7 @@ export class ToolCard implements Component {
 	}
 
 	appendOutput(text: string): void {
-		for (const line of text.split("\n")) this.outputs.push(line.trimEnd());
+		for (const line of text.split("\n")) { this.outputs.push(line.trimEnd()); if (this.outputs.length > 200) this.outputs.splice(0, this.outputs.length - 200); }
 	}
 
 	finish(failed = false): void {

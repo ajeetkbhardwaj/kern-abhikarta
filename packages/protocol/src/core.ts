@@ -178,6 +178,7 @@ export type DiagnosticCode =
   | "E_TOOL_DENIED"
   | "E_TOOL_TIMEOUT"
   | "E_TOOL_FAILED"
+  | "E_BUDGET_EXCEEDED"
   | "E_SESSION_PARSE"
   | "E_SESSION_MIGRATION"
   | "E_RESOURCE_LOAD"

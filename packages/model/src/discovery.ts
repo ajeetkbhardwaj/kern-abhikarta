@@ -313,6 +313,11 @@ export async function loadModelsFile(cwd: string): Promise<ModelsFile> {
     if (parsed.defaultProvider !== undefined) merged.defaultProvider = parsed.defaultProvider;
     if (parsed.defaultModel !== undefined) merged.defaultModel = parsed.defaultModel;
     for (const [name, cfg] of Object.entries(parsed.providers ?? {})) {
+      if (path !== modelsFilePaths(cwd)[0] && typeof cfg.apiKey === "string" && cfg.apiKey.trim().startsWith("!")) {
+        // Fail-closed: a cloned repo must not execute shell for credentials.
+        // Project file may use $VAR or literals; !command only from ~/.kern.
+        delete (cfg as Partial<ProviderConfig>).apiKey;
+      }
       const prev = merged.providers?.[name];
       merged.providers = { ...merged.providers, [name]: mergeProvider(prev, cfg) };
     }

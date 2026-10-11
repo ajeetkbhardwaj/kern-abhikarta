@@ -21,6 +21,18 @@ export function resetIdCounters(): void {
   counters.clear();
 }
 
+/** Reseed counters past ids already on disk so resumed sessions never reuse ids. */
+export function reseedIdCounters(ids: Iterable<string>): void {
+  for (const id of ids) {
+    const m = /^([A-Za-z]+)_(\d+)$/.exec(id);
+    if (!m) continue;
+    const prefix = m[1]!;
+    const n = Number(m[2]);
+    if (!Number.isInteger(n)) continue;
+    if ((counters.get(prefix) ?? 0) < n) counters.set(prefix, n);
+  }
+}
+
 export function newSessionId(): string {
   return `s_${randomBytes(6).toString("hex")}`;
 }
@@ -45,8 +57,8 @@ export function createLogger(level: LogLevel = "info", sink: (line: string) => v
   const enabled = LEVEL_ORDER[level];
   const emit = (lvl: LogLevel, message: string, data?: unknown) => {
     if (LEVEL_ORDER[lvl] < enabled) return;
-    const payload = data === undefined ? "" : ` ${JSON.stringify(data, jsonReplacer)}`;
-    sink(`${now()} ${lvl.toUpperCase().padEnd(5)} ${message}${payload}`);
+    const payload = data === undefined ? "" : ` ${redact(JSON.stringify(data, jsonReplacer))}`;
+    sink(`${now()} ${lvl.toUpperCase().padEnd(5)} ${redact(message)}${payload}`);
   };
   return {
     debug: (m, d) => emit("debug", m, d),
@@ -93,11 +105,18 @@ const REDACTION_RULES: RedactionRule[] = [
 export const SENSITIVE_PATHS: RegExp[] = [
   /(?:^|\/)\.ssh\//,
   /(?:^|\/)\.aws\//,
-  /(?:^|\/)id_(?:rsa|dsa|ecdsa|ed25519)$/,
+  /(?:^|\/)id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$/,
   /(?:^|\/)\.npmrc$/,
   /(?:^|\/)\.netrc$/,
   /(?:^|\/)\.env(?:\.|$)/,
   /(?:\.pem|\.key|\.p12|\.pfx)$/,
+  /(?:^|\/)\.kern\/auth\.json$/,
+  /(?:^|\/)\.kern\/models\.json$/,
+  /(?:^|\/)\.git-credentials$/,
+  /(?:^|\/)\.config\/gh\/hosts\.yml$/,
+  /(?:^|\/)\.kube\/config$/,
+  /(?:^|\/)\.gnupg\//,
+  /(?:^|\/)(?:secrets|credentials)\.json$/,
 ];
 
 export function isSensitivePath(path: string): boolean {

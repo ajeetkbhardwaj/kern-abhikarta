@@ -22,6 +22,7 @@ import {
   now,
   serializeError,
   KernError,
+  redact,
 } from "@kern/protocol";
 import { SessionManager } from "@kern/session-store";
 import { ToolRegistry } from "@kern/tools";
@@ -337,6 +338,7 @@ export class AgentRuntime {
           if (attempt > 1) this.events.emit({ type: "auto_retry_end", attempt, success, reason: kind ?? "success" });
         },
       },
+      signal,
     );
   }
 
@@ -352,10 +354,13 @@ export class AgentRuntime {
       origin: "model",
       requestApproval: this.requestApproval,
     });
+    // Users paste and store secrets by accident — redact tool text before it
+    // persists to JSONL or returns to the model. Shape stays identical.
+    const safeContent = result.content.map((c) => ({ type: "text" as const, text: redact(c.text) }));
     const block: ToolResultBlock = {
       type: "tool_result",
       toolCallId: call.id,
-      content: result.content,
+      content: safeContent,
       isError: result.isError,
       details: result.details,
     };

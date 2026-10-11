@@ -148,22 +148,17 @@ dark theme (violet accent, green success, red errors, muted grays).
 
 Startup shows a header box (`kern  provider/model · manual · /cwd`), `Type a task, or /help for commands.`, the key-hint line, and — on a fresh session — a suggestions overlay (`Summarize this repo`, `Find TODOs`, `Run tests`; `↑↓+Enter` or `1-3` fills the prompt, never sends; `Esc` dismisses). Dialogs (pickers, approvals, wizard steps) float centered over the transcript.
 
-### Typing & editor (pi-tui `Editor`)
+### Typing & editor
 
-- **Enter** sends. **Shift+Enter** (or Alt+Enter) inserts a newline (multi-line prompt). The editor draws its own frame — that border *is* the prompt box.
+- **Enter** sends. **Shift+Enter** (or Alt+Enter) inserts a newline.
 - **Tab** accepts the top completion; **Up/Down** navigates the dropdown; **Esc** dismisses it.
-- **Type `/`** for slash commands, **type `@`** to attach a file — dropdown with descriptions. File search shells out to the `fd` binary when present on `PATH` (slash-command completion always works, even without `fd`). `@path` files are inlined into the prompt as `<file path="…">…</file>` (40 KB cap each; missing files are sent literally with a notice).
+- The editor starts blank; you type your own task and query directly. Kern does not inject forced suggestion prompts into a fresh session.
+- **Type `/`** for slash commands, **type `@`** to attach a file — dropdown with descriptions. File search shells out to the `fd` binary when present on `PATH`.
 - **Type `!cmd`** to run a shell command directly (`! npm test`): output prints immediately (first 60 lines) *and* the agent responds to it.
 - Readline keys: `Ctrl+A/E` line start/end, word jump, word kill, `Ctrl+K/U` kill, `Ctrl+Y` yank, undo history; Kern adds `Ctrl+S` stash/restore draft, `Ctrl+R` history search, `Ctrl+L` redraw.
-- Large pastes are handled by the editor (bracketed paste); IME candidate windows position at the hardware cursor.
-- Invisible paste smuggling (zero-width/bidi chars) is stripped and you are asked to review before sending.
-
-### While the agent works
-
-- Anything you type is **queued** (cap 5, numbered list above the editor, `Ctrl+Q` clears all, `Backspace` on an empty prompt removes the last queued item). Queued messages send automatically in order when the turn settles.
-- **Ctrl+C** aborts the turn; **Ctrl+D twice** (within 800 ms) exits; `/quit` or `/exit` exits.
-- A spinner shows elapsed time and current activity (`thinking`, `running bash`, `compacting context`, `retrying (…)`).
-- Transient notices appear as one-line **toasts** above the queue (`queued 2/5`, `retry 2 (…)`, `context compacted`, `saved`, mode changes…). Errors stay in the transcript permanently — toasts never hide errors.
+- A compact status row sits directly above the editor and shows a rotating spinner + current phase such as `thinking...`, `writing...`, `running search...`, `ready`.
+- While the agent works, anything you type is **queued** (cap 5, numbered list above the editor, `Ctrl+Q` clears all, `Backspace` on an empty prompt removes the last queued item). Queued messages send automatically in order when the turn settles.
+- **Esc** aborts the *active* turn immediately; **Ctrl+C** also cancels the current turn; **Ctrl+D twice** exits.
 
 ### Assistant output (pi-tui `Markdown` + Kern cards)
 

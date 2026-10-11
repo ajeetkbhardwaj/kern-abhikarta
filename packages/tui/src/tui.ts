@@ -39,7 +39,7 @@ import {
   type Component,
   type OverlayHandle,
 } from "@earendil-works/pi-tui";
-import { theme, statusBg, buildMarkdownTheme, buildSelectTheme, buildEditorTheme, highlightCode } from "./theme.js";
+import { theme, buildMarkdownTheme, buildSelectTheme, buildEditorTheme } from "./theme.js";
 import { Box, StatusBar, ToolCard, Rule, Container, Text, Spacer } from "./components.js";
 import { buildAutocomplete } from "./autocomplete.js";
 
@@ -83,9 +83,6 @@ const QUICK_HELP = "Quick actions: /model · /switch · /connect · /new · /hel
 const MAX_QUEUE = 5;
 // Zero-width / bidi / tag invisibles (keeps ZWNJ U+200C for Persian/Indic).
 const INVISIBLE_RE = /[​‎‏‪-‮⁠-⁤﻿]/gu;
-
-void statusBg;
-void highlightCode;
 
 /**
  * Overlay root: renders a teammate-owned Box, forwards keys to the
@@ -165,6 +162,38 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     }, 4000);
   };
 
+  // Live agent phase indicator pinned above the editor so the user can see
+  // what the agent is doing while it writes, thinks, or calls tools.
+  const activityLine = new Text(theme.muted("ready"), 0, 0);
+  const ACTIVITY_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"] as const;
+  let activityDots = 0;
+  let activityPulse: ReturnType<typeof setInterval> | null = null;
+  const renderActivityLine = () => {
+    const label = activity || "ready";
+    const frame = ACTIVITY_SPINNER[activityDots % ACTIVITY_SPINNER.length] ?? "⠦";
+    const suffix = label === "ready" ? "" : "...";
+    activityLine.setText(theme.muted(`${frame} ${label}${suffix}`));
+    tui.requestRender();
+  };
+  const setActivity = (label: string) => {
+    if (activity === label && activityPulse) return;
+    activity = label;
+    activityDots = 0;
+    if (label === "ready") {
+      if (activityPulse) clearInterval(activityPulse);
+      activityPulse = null;
+      activityLine.setText(theme.muted("ready"));
+      tui.requestRender();
+      return;
+    }
+    renderActivityLine();
+    if (activityPulse) clearInterval(activityPulse);
+    activityPulse = setInterval(() => {
+      activityDots = (activityDots + 1) % ACTIVITY_SPINNER.length;
+      renderActivityLine();
+    }, 180);
+  };
+
   // Queue visibility: numbered list above the editor. Reads `queue` live;
   // callers just mutate the array and request a render.
   const queuePanel: Component = {
@@ -190,6 +219,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   const dock = new VStack([
     { component: queuePanel, shrink: 1, minSize: 0 },
     { component: toastLine, shrink: 1, minSize: 0 },
+    { component: activityLine, shrink: 1, minSize: 0 },
     { component: editor, shrink: 1, minSize: 3 },
     { component: statusBar, shrink: 1, minSize: 0 },
   ]);
@@ -223,7 +253,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     tui.requestRender();
   };
 
-  const modeLabel = () => (session.approvalMode() === "ask" ? "manual" : session.approvalMode());
+  const modeLabel = () => {
+    const mode = session.approvalMode();
+    return mode === "ask" ? "manual" : (mode ?? "manual");
+  };
 
   const printHeader = () => {
     const m = session.modelInfo();
@@ -295,13 +328,17 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     const u = session.budgetUsage();
     const m = session.modelInfo();
     const usage = session.contextUsage();
-    const ctx = usage ? `ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%` : "ctx —";
+    const ctx =
+      usage && m.contextWindow > 0
+        ? `ctx ${Math.round((usage.totalTokens / m.contextWindow) * 100)}%`
+        : "ctx —";
     const sessionName = session.sessionName() ? ` · ${session.sessionName()}` : "";
+    const wallSecs = Number.isFinite(u.wallTimeMs) ? (u.wallTimeMs / 1000).toFixed(1) : "0.0";
     statusBar.setSegments([
       `${m.provider}/${m.modelId}${sessionName}`,
       modeLabel(),
       ctx,
-      `${u.turns} turns · ${u.totalToolCalls} calls · ${(u.wallTimeMs / 1000).toFixed(1)}s`,
+      `${u.turns} turns · ${u.totalToolCalls} calls · ${wallSecs}s`,
     ]);
     tui.requestRender();
   };
@@ -313,6 +350,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   let reasoningBuffer = "";
   let turnNumber = 0;
   const cards = new Map<string, ToolCard>();
+  /** Pending approval finish callbacks — resolved fail-closed (deny) on abort/exit. */
+  const pendingApprovals = new Set<(value: string | null) => void>();
+  const denyPendingApprovals = () => {
+    if (pendingApprovals.size === 0) return;
+    for (const finish of [...pendingApprovals]) finish(null);
+    pendingApprovals.clear();
+  };
+  /** Mark in-flight tool cards done so a cancelled/failed turn never leaves a stuck ◈. */
+  const settleCards = (failed: boolean) => {
+    if (cards.size === 0) return;
+    for (const card of cards.values()) {
+      if (!card.isDone()) card.finish(failed);
+    }
+    cards.clear();
+  };
   const closeAssistant = () => {
     md = null;
     mdText = "";
@@ -374,10 +426,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           renderAssistantBlock();
           mdText += event.delta;
           md?.setText(mdText);
+          setActivity("writing response");
           tui.requestRender();
           break;
         case "reasoning_delta":
-          activity = "thinking";
+          setActivity("thinking");
           if (loader) loader.setMessage("thinking");
           renderReasoningBlock();
           reasoningBuffer += event.delta;
@@ -387,18 +440,30 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         case "message_end":
           closeAssistant();
           closeReasoning();
+          settleCards(false);
+          setActivity("ready");
           transcript.addChild(new Spacer(1));
           transcript.addChild(new Rule());
           tui.requestRender();
           break;
         case "tool_execution_start": {
           closeAssistant();
-          activity = `running ${event.toolName}`;
-          if (loader) loader.setMessage(activity);
+          const next = `running ${event.toolName}`;
+          setActivity(next);
+          if (loader) loader.setMessage(next);
           const card = new ToolCard(event.toolName, summarizeArgs(event.arguments));
           cards.set(event.toolCallId, card);
           addTranscriptGap();
           transcript.addChild(new Box(card, { title: turnLabel("tool"), mood: "info" }));
+          tui.requestRender();
+          break;
+        }
+        case "tool_execution_update": {
+          const next = `running ${event.toolName}`;
+          setActivity(next);
+          if (loader) loader.setMessage(next);
+          const card = cards.get(event.toolCallId);
+          if (card && typeof event.delta === "string") card.appendOutput(event.delta);
           tui.requestRender();
           break;
         }
@@ -414,33 +479,28 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           } else {
             say(event.isError ? theme.error(`✖ ${event.toolName} failed`) : theme.success(`✔ ${event.toolName} done`));
           }
-          tui.requestRender();
-          break;
-        }
-        case "tool_execution_update": {
-          activity = `running ${event.toolName}`;
-          if (loader) loader.setMessage(activity);
-          const card = cards.get(event.toolCallId);
-          if (card && typeof event.delta === "string") card.appendOutput(event.delta);
+          setActivity(event.isError ? "tool failed" : "ready");
           tui.requestRender();
           break;
         }
         case "auto_compaction_start":
-          activity = "compacting context";
-          if (loader) loader.setMessage(activity);
+          setActivity("compacting context");
+          if (loader) loader.setMessage("compacting context");
           toast(`compacting context (${event.phase})…`);
           break;
         case "auto_compaction_end":
           toast("context compacted");
           break;
         case "auto_retry_start":
-          activity = `retrying (${event.reason})`;
-          if (loader) loader.setMessage(activity);
+          setActivity(`retrying (${event.reason})`);
+          if (loader) loader.setMessage(`retrying (${event.reason})`);
           toast(`retry ${event.attempt} (${event.reason}) in ${event.delayMs}ms`);
           break;
         case "agent_error":
           closeAssistant();
           closeReasoning();
+          settleCards(true);
+          setActivity("error");
           err(`[error ${event.error.code}] ${event.error.message}`);
           if (event.error.code === "E_MODEL_AUTH") {
             showAuthCard(event.error.message);
@@ -450,6 +510,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         case "agent_settled":
           closeAssistant();
           closeReasoning();
+          settleCards(false);
+          setActivity("ready");
           break;
         default:
           break;
@@ -529,15 +591,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     // them through at runtime, in which case we pretty-print them too.
     const runtimeArgs = (meta as unknown as { arguments?: unknown } | undefined)?.arguments;
     let argsDetail = "";
+    let argsFull = "";
     if (runtimeArgs !== undefined) {
       try {
         const pretty = JSON.stringify(runtimeArgs, null, 2);
-        argsDetail = pretty.length > 800 ? pretty.slice(0, 800) + "\n[…truncated…]" : pretty;
+        argsFull = pretty;
+        argsDetail = pretty.length > 800 ? pretty.slice(0, 800) + "\n[…truncated… full command hidden — deny if unsure]" : pretty;
       } catch {
         argsDetail = String(runtimeArgs).slice(0, 800);
+        argsFull = argsDetail;
       }
     }
-    const danger = DESTRUCTIVE_PATTERNS.some((re) => re.test(prompt));
+    const danger = DESTRUCTIVE_PATTERNS.some((re) => re.test(prompt) || (argsFull && re.test(argsFull)));
     const picked = await new Promise<string | null>((resolve) => {
       const body = new Container();
       body.addChild(new Text(danger ? theme.error(prompt) : theme.warn(prompt), 0, 0));
@@ -567,10 +632,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       const finish = (value: string | null) => {
         if (done) return;
         done = true;
+        pendingApprovals.delete(finish);
         handle.hide();
         tui.setFocus(editor);
         resolve(value);
       };
+      pendingApprovals.add(finish);
       list.onSelect = (item) => finish(item.value);
       list.onCancel = () => finish(null);
     });
@@ -586,7 +653,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // --- transcript export ----------------------------------------------------------
   const exportTranscript = async (file?: string): Promise<void> => {
     const path = manager.getActivePath();
-    const target = file ?? join(cwd, `kern-session-${manager.sessionId ?? "export"}.md`);
+    const rawTarget = file ?? join(cwd, `kern-session-${manager.sessionId ?? "export"}.md`);
+    let target = rawTarget;
+    try {
+      target = resolve(cwd, rawTarget);
+      const rel = resolve(target);
+      if (!rel.startsWith(resolve(cwd) + "/") && rel !== resolve(cwd)) {
+        err(`Export refused: path escapes workspace: ${file}`);
+        return;
+      }
+    } catch (error) {
+      err(`Export refused: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     const lines: string[] = [`# kern session`, ""];
     const m = session.modelInfo();
     lines.push(`- model: ${m.provider}/${m.modelId}`, `- cwd: ${cwd}`, "");
@@ -618,7 +697,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   // --- @mention expansion -----------------------------------------------------------
   const expandMentions = async (text: string): Promise<{ text: string; missing: string[] }> => {
     const missing: string[] = [];
-    const refs = [...new Set([...text.matchAll(/(^|\s)@([^\s]+)/g)].map((m) => m[2] ?? ""))].filter(Boolean);
+    const rawRefs = [...new Set([...text.matchAll(/(^|\s)@([^\s]+)/g)].map((m) => m[2] ?? ""))].filter(Boolean);
+    const refs = rawRefs.map((r) => r.replace(/[.,:;!?)\]]+$/, "")).filter(Boolean);
     let out = text;
     for (const ref of refs) {
       const abs = resolve(cwd, ref);
@@ -626,10 +706,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       try {
         const st = await stat(abs);
         if (!st.isFile()) {
-          missing.push(ref);
+          info(`@${ref}: not a file — sent literally.`);
           continue;
         }
         content = await readFile(abs, "utf8");
+        if (content.includes("\0")) {
+          missing.push(ref);
+          info(`@${ref}: binary file — sent literally.`);
+          continue;
+        }
         if (content.length > 40_000) content = content.slice(0, 40_000) + "\n[…truncated…]";
       } catch {
         missing.push(ref);
@@ -1178,6 +1263,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         return false;
       case "/clear":
         transcript.clear();
+        cards.clear();
+        closeAssistant();
+        closeReasoning();
         printHeader();
         printStatus();
         return true;
@@ -1217,8 +1305,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
         try {
           const res = await session.callToolAsUser("bash", { command: "git diff --stat; git status --short | head -20" });
           const text = res.content.map((c) => c.text).join("\n") || "(clean)";
-          say(theme.bold("working tree"));
-          say(text);
+          if (res.isError) err(text);
+          else {
+            say(theme.bold("working tree"));
+            say(text);
+          }
           if (res.isError) info("Not a git repository, or git failed.");
         } catch (error) {
           err(`Diff failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1236,6 +1327,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
           session = fresh.session;
           manager = fresh.manager;
           queue = [];
+          cards.clear();
+          closeAssistant();
+          closeReasoning();
+          lastUserPrompt = "";
           renderQueue();
           subscribe();
           transcript.clear();
@@ -1283,9 +1378,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
   };
 
   const runTurn = (text: string) => {
+    if (busy) return;
     busy = true;
     abort = new AbortController();
     activity = "thinking";
+    setActivity("thinking");
     lastUserPrompt = text;
     setBusy(true);
     turnNumber += 1;
@@ -1293,6 +1390,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     session
       .prompt(text, { signal: abort.signal })
       .catch((error: unknown) => {
+        if (error instanceof Error && (error.name === "AbortError" || /aborted|canceled|cancelled/i.test(error.message))) {
+          info("Turn stopped.");
+          return;
+        }
         err(`Turn failed: ${error instanceof Error ? error.message : String(error)}`);
       })
       .finally(() => {
@@ -1311,15 +1412,41 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       });
   };
 
+  const stopCurrentTurn = () => {
+    if (!busy) return false;
+    queue = [];
+    renderQueue();
+    abort?.abort();
+    settleCards(true);
+    denyPendingApprovals();
+    closeAssistant();
+    closeReasoning();
+    if (loader) {
+      loader.stop();
+      transcript.removeChild(loader);
+      loader = null;
+    }
+    toast("Stopped current run.");
+    setActivity("ready");
+    return true;
+  };
+
   /** `!cmd`: run directly, show output, and have the agent respond to it. */
   const runShellMode = async (command: string) => {
+    if (busy) {
+      toast("A turn is running — shell mode waits for settle.");
+      return;
+    }
     say(theme.tool(`◈ !${command}`));
     try {
       const res = await session.callToolAsUser("bash", { command });
       const output = res.content.map((c) => c.text).join("\n");
-      say(theme.muted(output.split("\n").slice(0, 60).join("\n")));
+      if (!output.trim()) info("(no output)");
+      else if (res.isError) err(output.split("\n").slice(0, 60).join("\n"));
+      else say(theme.muted(output.split("\n").slice(0, 60).join("\n")));
       if (output.split("\n").length > 60) info(`[…${output.split("\n").length - 60} more lines in context]`);
-      runTurn(`I ran \`${command}\` in shell mode. Output:\n${output}\n\nRespond to it.`);
+      const capped = output.length > 12_000 ? output.slice(0, 12_000) + "\n[…truncated…]" : output;
+      runTurn(`I ran \`${command}\` in shell mode. Output:\n${capped}\n\nRespond to it.`);
     } catch (error) {
       err(`Shell command failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1329,13 +1456,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (exiting) return;
     if (busy) {
       const text = line.trim();
-      if (text) {
-        if (queue.length >= MAX_QUEUE) toast(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`);
-        else {
-          queue.push(line);
-          renderQueue();
-          toast(`queued ${queue.length}/${MAX_QUEUE}`);
-        }
+      if (!text) return;
+      if (text.startsWith("/") || (text.startsWith("!") && !text.startsWith("!="))) {
+        toast("Commands wait for settle — type plain text to queue.");
+        return;
+      }
+      if (queue.length >= MAX_QUEUE) toast(`Queue full (${MAX_QUEUE}) — wait for the turn to settle.`);
+      else {
+        queue.push(text);
+        renderQueue();
+        toast(`queued ${queue.length}/${MAX_QUEUE}`);
       }
       return;
     }
@@ -1436,6 +1566,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     if (exiting) return;
     exiting = true;
     abort?.abort();
+    denyPendingApprovals();
+    if (activityPulse) clearInterval(activityPulse);
+    if (toastTimer) clearTimeout(toastTimer);
     options.approvalHook.current = null;
     unsubscribe?.();
     tui.stop();
@@ -1466,22 +1599,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
       return { consume: true };
     }
     if (tui.hasOverlay()) {
-      // Number-key quick fill for the empty-state suggestions overlay.
-      // Routes through the overlay's own finish path (fill, never send).
-      if (suggestionsOpen && suggestionPick) {
-        for (let n = 0; n < SUGGESTIONS.length && n < SUGGESTION_DIGITS.length; n++) {
-          const digit = SUGGESTION_DIGITS[n];
-          if (digit && matchesKey(key, digit)) {
-            suggestionPick(SUGGESTIONS[n] ?? "");
-            return { consume: true };
-          }
-        }
-      }
       return undefined; // overlays own Esc/arrows/Enter
+    }
+    if (matchesKey(key, "escape")) {
+      if (stopCurrentTurn()) return { consume: true };
+      if (editor.getText().length > 0) {
+        editor.setText("");
+        return { consume: true };
+      }
+      return undefined;
     }
     if (matchesKey(key, "ctrl+c")) {
       if (busy) {
-        abort?.abort();
+        stopCurrentTurn();
         return { consume: true };
       }
       if (editor.getText().length === 0) requestExit();
@@ -1535,13 +1665,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
     return undefined;
   });
 
-  printHeader();
-  printStatus();
   tui.start();
-  if (manager.getActiveMessages().length === 0) {
-    info("No history yet — pick a suggestion (↑↓+Enter or 1-3 fills the prompt, never sends) or type your own.");
-    await showSuggestions();
-  }
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (exiting) {
@@ -1595,6 +1719,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<void>
             session = next.session;
             manager = next.manager;
             queue = [];
+            cards.clear();
+            closeAssistant();
+            closeReasoning();
+            lastUserPrompt = "";
             renderQueue();
             subscribe();
             transcript.clear();

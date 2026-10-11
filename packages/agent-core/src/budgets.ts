@@ -43,24 +43,24 @@ export class BudgetTracker {
   }
 
   checkTurn(nextTurn: number): void {
-    this.turns = nextTurn;
     this.checkWallTime();
     if (nextTurn > this.limits.maxTurns) {
-      throw new KernError("E_INTERNAL", `Turn budget exceeded (${nextTurn} > ${this.limits.maxTurns})`, {
+      throw new KernError("E_BUDGET_EXCEEDED", `Turn budget exceeded (${nextTurn} > ${this.limits.maxTurns})`, {
         details: { budget: "maxTurns", ...this.usage() },
       });
     }
+    this.turns = nextTurn;
   }
 
   checkToolBatch(size: number): void {
     this.checkWallTime();
     if (size > this.limits.maxToolCallsPerTurn) {
-      throw new KernError("E_INTERNAL", `Per-turn tool-call budget exceeded (${size} > ${this.limits.maxToolCallsPerTurn})`, {
+      throw new KernError("E_BUDGET_EXCEEDED", `Per-turn tool-call budget exceeded (${size} > ${this.limits.maxToolCallsPerTurn})`, {
         details: { budget: "maxToolCallsPerTurn", ...this.usage() },
       });
     }
     if (this.totalToolCalls + size > this.limits.maxTotalToolCalls) {
-      throw new KernError("E_INTERNAL", `Total tool-call budget exceeded (${this.totalToolCalls + size} > ${this.limits.maxTotalToolCalls})`, {
+      throw new KernError("E_BUDGET_EXCEEDED", `Total tool-call budget exceeded (${this.totalToolCalls + size} > ${this.limits.maxTotalToolCalls})`, {
         details: { budget: "maxTotalToolCalls", ...this.usage() },
       });
     }
@@ -73,7 +73,7 @@ export class BudgetTracker {
   checkWallTime(): void {
     const elapsed = Date.now() - this.startedAt;
     if (elapsed > this.limits.maxWallTimeMs) {
-      throw new KernError("E_INTERNAL", `Wall-time budget exceeded (${elapsed}ms > ${this.limits.maxWallTimeMs}ms)`, {
+      throw new KernError("E_BUDGET_EXCEEDED", `Wall-time budget exceeded (${elapsed}ms > ${this.limits.maxWallTimeMs}ms)`, {
         details: { budget: "maxWallTimeMs", ...this.usage() },
       });
     }

@@ -93,8 +93,17 @@ export class Compactor {
    */
   evaluate(snapshot: ContextSnapshot, contextWindow: number, safetyMargin = 1000): CompactionDecision {
     const totalTokens = snapshot.usage.totalTokens;
-    const reserve = Math.max(this.outputReserve, Math.ceil(contextWindow * 0.1));
-    const budgetTokens = Math.floor(contextWindow * this.threshold) - reserve - safetyMargin;
+    const safeWindow = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 0;
+    const reserve = Math.max(this.outputReserve, Math.ceil(safeWindow * 0.1));
+    const budgetTokens = Math.floor(safeWindow * this.threshold) - reserve - safetyMargin;
+    if (safeWindow <= 0 || budgetTokens <= 0) {
+      return {
+        shouldCompact: totalTokens > 0,
+        reason: `context window ${contextWindow} too small for budget (budget ${budgetTokens})`,
+        totalTokens,
+        budgetTokens,
+      };
+    }
     if (totalTokens >= budgetTokens) {
       return {
         shouldCompact: true,
@@ -137,7 +146,8 @@ export class Compactor {
         if (e.type !== "message") return "";
         return `--- ${e.message.role} (${e.id}) ---\n${renderMessage(e.message)}`;
       })
-      .join("\n\n");
+      .join("\n\n")
+      .slice(0, 120_000);
 
     const userText = [
       previous ? `Previous checkpoint (update it, do not discard its facts unless superseded):\n${previous.summary}` : null,
