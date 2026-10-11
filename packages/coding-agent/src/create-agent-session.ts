@@ -10,7 +10,7 @@ import {
   DEFAULT_POLICY_CONFIG,
   type PolicyConfig,
 } from "@kern/tools";
-import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel } from "@kern/protocol";
+import { createLogger, type Logger, type ModelAdapter, type ModelInfo, type AgentEventListener, type ToolResult, type ThinkingLevel, type ToolDefinition } from "@kern/protocol";
 import type { BudgetLimits, ContextUsage } from "@kern/agent-core";
 import { RepoIndex } from "@kern/repo-index";
 import { SymbolStore } from "@kern/symbol-store";
@@ -36,6 +36,8 @@ export interface CreateAgentSessionOptions {
   enableCompaction?: boolean;
   /** Inject a real model adapter. Defaults to a no-op fake (final response). */
   model?: ModelAdapter;
+  /** Opt-in extra tools (e.g. MCP bridge). Registered after built-ins; name collisions are refused. */
+  extraTools?: ToolDefinition[];
   /** Default reasoning mode for the active model. */
   thinkingLevel?: ThinkingLevel;
   /** Resume the most recent session instead of creating a new one. */
@@ -131,6 +133,13 @@ async function buildSessionWithRuntime(
   tools.register(createWriteTool(options.cwd));
   tools.register(createEditTool(options.cwd));
   tools.register(createBashTool(options.cwd));
+  for (const extra of options.extraTools ?? []) {
+    if (tools.has(extra.name)) {
+      logger.warn("extra_tool_name_collision", { name: extra.name });
+      continue;
+    }
+    tools.register(extra);
+  }
 
   const events = new EventBus(logger);
 

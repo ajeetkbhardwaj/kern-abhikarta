@@ -117,6 +117,7 @@ export class ToolRegistry {
       arguments: args,
       cwd: this.workspaceRoot,
       origin,
+      sideEffect: tool.sideEffect,
     });
     if (policy.decision === "deny") {
       return textResult(policy.reason, true, { code: "E_TOOL_DENIED" });
@@ -217,8 +218,11 @@ export function createReadTool(root: string): ToolDefinition<{ path: string; off
         const st = await stat(target);
         if (st.isDirectory()) {
           const entries = await readdir(target);
-          const text = entries.sort().map((e) => `- ${e}`).join("\n");
+          const text = entries.sort().slice(0, 500).map((e) => `- ${e}`).join("\n");
           return { content: [{ type: "text", text }], isError: false };
+        }
+        if (st.size > 2_000_000) {
+          return textResult(`File too large (${st.size} bytes, cap 2 MB). Refusing to inject into context.`, true, { code: "E_TOOL_FAILED" });
         }
         const text = await readFile(target, "utf8");
         if (text.includes("\0")) {
@@ -228,8 +232,13 @@ export function createReadTool(root: string): ToolDefinition<{ path: string; off
             details: { binary: true, size: st.size },
           };
         }
-        const offset = args.offset ?? 1;
-        const limit = Math.min(args.limit ?? 400, 2000);
+        const rawOffset = args.offset ?? 1;
+        const rawLimit = args.limit ?? 400;
+        if (!Number.isInteger(rawOffset) || rawOffset < 1 || !Number.isInteger(rawLimit) || rawLimit < 1) {
+          return textResult(`Invalid offset/limit: expected positive integers, got offset=${String(args.offset)} limit=${String(args.limit)}`, true, { code: "E_TOOL_INVALID_ARGS" });
+        }
+        const offset = rawOffset;
+        const limit = Math.min(rawLimit, 2000);
         const lines = text.split("\n");
         const start = Math.max(0, offset - 1);
         const end = Math.min(lines.length, start + limit);

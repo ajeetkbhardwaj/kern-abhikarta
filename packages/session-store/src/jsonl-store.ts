@@ -89,33 +89,19 @@ export class SessionStore {
     if (!existsSync(filePath)) return;
     const stream = createReadStream(filePath, { encoding: "utf8" });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    const lines: string[] = [];
     for await (const line of rl) {
-      lines.push(line);
-    }
-    const total = lines.length;
-    for (let i = 0; i < total; i++) {
-      const line = lines[i]!;
       const trimmed = line.trim();
       if (trimmed.length === 0) continue;
       let parsed: unknown;
       try {
         parsed = JSON.parse(trimmed);
-      } catch (error) {
-        if (this.quarantineLastMalformed && i === total - 1) {
-          this.logger.warn("jsonl_malformed_trailing_quarantined", { filePath });
-          continue;
-        }
+      } catch {
         this.logger.warn("jsonl_malformed_line_skipped", { filePath });
         continue;
       }
       if (this.validateOnLoad) {
         const v = safeValidateSessionEntry(parsed);
         if (!v.success) {
-          if (this.quarantineLastMalformed && i === total - 1) {
-            this.logger.warn("jsonl_invalid_trailing_quarantined", { filePath });
-            continue;
-          }
           this.logger.warn("jsonl_invalid_line_skipped", { filePath });
           continue;
         }

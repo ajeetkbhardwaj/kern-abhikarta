@@ -148,6 +148,9 @@ importers:
       '@kern/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@kern/tools':
+        specifier: workspace:*
+        version: link:../tools
       '@kern/tui':
         specifier: workspace:*
         version: link:../tui

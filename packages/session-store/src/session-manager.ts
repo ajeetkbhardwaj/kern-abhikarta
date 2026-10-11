@@ -92,6 +92,8 @@ export class SessionManager {
     for (const e of entries.values()) {
       if (typeof e.seq === "number" && e.seq > lastSeq) lastSeq = e.seq;
     }
+    const { reseedIdCounters } = await import("@kern/protocol");
+    reseedIdCounters(entries.keys());
     this.state = { entries, children, activeLeafId: lastId, headerId: header.id, lastSeq };
     const { validateInvariants } = await import("./invariants.js");
     const inv = validateInvariants(this.state);
@@ -177,7 +179,16 @@ export class SessionManager {
     return this.state.lastSeq;
   }
 
+  /** Serialize appends so concurrent callers never share a parentId/seq. */
+  private appendChain: Promise<unknown> = Promise.resolve();
+  private serialized<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.appendChain.then(fn, fn);
+    this.appendChain = run.catch(() => undefined);
+    return run;
+  }
+
   async appendUserMessage(text: string): Promise<MessageEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const msg: ChatMessage = { role: "user", content: [{ type: "text", text }], timestamp: now() };
     const parentId = this.state.activeLeafId;
@@ -189,9 +200,11 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendAssistantMessage(msg: ChatMessage): Promise<MessageEntry> {
+    return this.serialized(async () => {
     if (!this.state || !this.filePath) throw new Error("SessionManager not initialized");
     const parentId = this.state.activeLeafId;
     const entry: MessageEntry = { id: newId("m"), parentId, timestamp: now(), type: "message", message: msg, seq: this.nextSeq() };
@@ -202,6 +215,7 @@ export class SessionManager {
     this.state.children.set(parentId, arr);
     this.state.activeLeafId = entry.id;
     return entry;
+    });
   }
 
   async appendToolResult(msg: ChatMessage): Promise<MessageEntry> {

@@ -58,6 +58,8 @@ export interface PolicyInput {
   arguments: unknown;
   cwd: string;
   origin: "model" | "user" | "extension";
+  /** Tool's declared side-effect class, when known. Drives the default ask-table. */
+  sideEffect?: SideEffect;
 }
 
 export interface ToolPolicyEngine {

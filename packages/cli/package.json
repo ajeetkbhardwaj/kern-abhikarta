@@ -12,6 +12,7 @@
     "@kern/protocol": "workspace:*",
     "@kern/coding-agent": "workspace:*",
     "@kern/model": "workspace:*",
+    "@kern/tools": "workspace:*",
     "@kern/tui": "workspace:*"
   }
 }

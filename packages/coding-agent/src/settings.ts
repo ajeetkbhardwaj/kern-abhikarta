@@ -14,14 +14,29 @@ export interface SessionSettings {
 export class SettingsManager {
   static async load(cwd: string, overrides: Partial<SessionSettings> = {}): Promise<SessionSettings> {
     const merged: SessionSettings = {};
-    for (const file of [join(homedir(), ".kern", "settings.json"), join(cwd, ".kern", "settings.json")]) {
-      try {
-        const text = await readFile(file, "utf8");
-        const parsed = JSON.parse(text) as Partial<SessionSettings>;
-        deepMergeInto(merged, parsed);
-      } catch {
-        // Ignore missing or invalid user/project config; the runtime keeps defaults.
+    try {
+      const text = await readFile(join(homedir(), ".kern", "settings.json"), "utf8");
+      deepMergeInto(merged, JSON.parse(text) as Partial<SessionSettings>);
+    } catch {
+      // Ignore missing or invalid user config; the runtime keeps defaults.
+    }
+    try {
+      const text = await readFile(join(cwd, ".kern", "settings.json"), "utf8");
+      const parsed = JSON.parse(text) as Partial<SessionSettings>;
+      // Fail-closed: a cloned repo must not loosen safety. Project file may
+      // only set thinkingLevel and tighten budgets — never policy.
+      if (parsed.thinkingLevel) merged.thinkingLevel = parsed.thinkingLevel;
+      if (parsed.budgets) {
+        merged.budgets = { ...(merged.budgets ?? {}) };
+        for (const [k, v] of Object.entries(parsed.budgets)) {
+          const cur = (merged.budgets as Record<string, unknown>)[k];
+          if (typeof v === "number" && Number.isFinite(v) && v > 0 && (typeof cur !== "number" || v < cur)) {
+            (merged.budgets as Record<string, unknown>)[k] = v;
+          }
+        }
       }
+    } catch {
+      // Ignore missing or invalid project config.
     }
     deepMergeInto(merged, overrides);
     return merged;

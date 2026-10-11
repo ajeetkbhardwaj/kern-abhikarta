@@ -4,12 +4,30 @@ import type { PolicyConfig } from "./policy-config.js";
 import { DEFAULT_POLICY_CONFIG } from "./policy-config.js";
 
 const DESTRUCTIVE_PATTERNS = [
-  /\brm\s+-rf\b/,
-  /\brm\s+-r\s+-f\b/,
+  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|--recursive\b.*--force\b|--force\b.*--recursive\b)\b/i,
+  /\brm\s+.*--no-preserve-root\b/i,
   /\bfind\b.*-delete\b/,
   /\bgit\s+reset\s+--hard\b/,
-  /\bgit\s+clean\s+-fdx\b/,
-  /\b:(){:|:&};:\b/,
+  /\bgit\s+clean\s+-[a-z]*f[a-z]*\b/,
+  /\bgit\s+push\b.*--force\b/,
+  /\bdd\b.*\bof=\/dev\//,
+  /\bmkfs\b/,
+  /\bshred\b/,
+  /\bchmod\s+-R\b.*\s\/(\s|$)/,
+  /\b: *\(\) *\{[^}]*\} *;/,
+  /\bcurl\b.*\|\s*(sh|bash)\b/,
+  /\bwget\b.*\|\s*(sh|bash)\b/,
+  /\bpython\d?\b.*shutil\.rmtree\b/,
+];
+
+const SENSITIVE_CMD_PATTERNS = [
+  /\.ssh\//,
+  /\.aws\//,
+  /\.kern\/auth\.json/,
+  /\.git-credentials/,
+  /\.config\/gh\//,
+  /id_rsa/,
+  /\.env\b/,
 ];
 
 export class AllowAllPolicy implements ToolPolicyEngine {
@@ -56,6 +74,9 @@ export class DefaultPolicy implements ToolPolicyEngine {
     const auto = this.config.approvalMode === "auto-allowlist" || this.sessionAllowed.has(name);
     if (name === "bash" && args && typeof args.command === "string") {
       const cmd = args.command;
+      if (SENSITIVE_CMD_PATTERNS.some((re) => re.test(cmd))) {
+        return { decision: "deny", reason: "Bash command touches sensitive credentials path" };
+      }
       if (DESTRUCTIVE_PATTERNS.some((re) => re.test(cmd))) {
         return { decision: "require_approval", prompt: `Destructive command detected. Approve? ${cmd}` };
       }
@@ -64,6 +85,12 @@ export class DefaultPolicy implements ToolPolicyEngine {
       }
     }
     if ((name === "write" || name === "edit") && this.config.approvalMode === "ask" && !auto) {
+      return { decision: "require_approval", prompt: `Approve ${name} operation?` };
+    }
+    // Any non-read tool (MCP plugins, future tools) asks, like bash/write/edit.
+    // Read-only tools (read, readOnlyHint MCP) stay always-allowed.
+    const effect = input.sideEffect ?? (name === "read" ? "read" : "execute");
+    if (effect !== "read" && this.config.approvalMode === "ask" && !auto) {
       return { decision: "require_approval", prompt: `Approve ${name} operation?` };
     }
     return { decision: "allow" };

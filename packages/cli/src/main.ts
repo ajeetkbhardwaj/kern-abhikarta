@@ -90,6 +90,24 @@ function askApproval(prompt: string): Promise<boolean> {
   });
 }
 
+/** Opt-in MCP plugin: mcp.json files (project + user) plus env overrides. Unset/unconfigured = core unchanged. Fail-closed. */
+async function loadMcpExtraTools(cwd: string, logger: ReturnType<typeof createLogger>): Promise<{ extraTools?: import("@kern/protocol").ToolDefinition[] }> {
+  try {
+    const { discoverMcpFileTools } = await import("@kern/tools");
+    const { tools, warnings } = await discoverMcpFileTools(cwd);
+    for (const w of warnings) {
+      logger.warn("mcp_bridge_notice", { message: w });
+      process.stderr.write(`[mcp ${w}]\n`);
+    }
+    if (tools.length > 0) process.stderr.write(`[mcp ${tools.length} tool(s)]\n`);
+    return tools.length > 0 ? { extraTools: tools } : {};
+  } catch (error) {
+    logger.warn("mcp_bridge_disabled", { message: error instanceof Error ? error.message : String(error) });
+    process.stderr.write(`[mcp bridge disabled: ${error instanceof Error ? error.message : String(error)}]\n`);
+    return {};
+  }
+}
+
 async function main() {
   const logger = createLogger(process.env["KERN_LOG"] === "debug" ? "debug" : "warn");
   const flags = parseArgs(process.argv.slice(2));
@@ -135,6 +153,7 @@ async function main() {
     budgets: flags.maxTurns !== undefined ? { maxTurns: flags.maxTurns } : undefined,
     requestApproval: (prompt: string, meta?: { toolName: string }) => (approvalHook.current ? approvalHook.current(prompt, meta) : askApproval(prompt)),
     ...(adapter ? { model: adapter } : {}),
+    ...await loadMcpExtraTools(flags.cwd, logger),
   };
   const startSession = () => createAgentSession({ ...sessionOptions });
   const { session, manager } = await startSession();

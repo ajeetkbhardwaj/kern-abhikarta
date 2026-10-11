@@ -55,7 +55,7 @@ desktop.ini
 sessions/
 agent/sessions/
 *.jsonl.tmp
-
+session-6f80ecdc-2814-4020-856b-75a61e4d7921.md
 # Temporary
 tmp/
 temp/
@@ -63,7 +63,7 @@ temp/
 **/tmp/
 **/.cache/
 .cache/
-
+.vscode/
 # Package manager
 .pnpm-store/
 node_modules/.cache/

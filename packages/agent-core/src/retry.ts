@@ -22,8 +22,19 @@ export interface RetryCallbacks {
   onSettled?: (attempt: number, success: boolean, kind?: ModelErrorKind) => void;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export async function withRetry<T>(
@@ -31,6 +42,7 @@ export async function withRetry<T>(
   classify: (err: unknown) => ModelErrorKind = classifyModelError,
   config: RetryConfig = DEFAULT_RETRY_CONFIG,
   callbacks: RetryCallbacks = {},
+  signal?: AbortSignal,
 ): Promise<T> {
   let delay = config.initialDelayMs;
   let lastErr: unknown;
@@ -51,7 +63,7 @@ export async function withRetry<T>(
       const jitter = delay * config.jitter * (Math.random() * 2 - 1);
       const waitMs = Math.max(0, Math.round(delay + jitter));
       callbacks.onRetry?.(attempt, lastKind, waitMs);
-      await sleep(waitMs);
+      await sleep(waitMs, signal);
       delay = Math.min(config.maxDelayMs, delay * config.multiplier);
     }
   }

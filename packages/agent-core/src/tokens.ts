@@ -42,7 +42,7 @@ export function countMessageTokens(message: ChatMessage): number {
     }
   }
   const roleCost = defaultTokenEstimator.countText(message.role);
-  const bodyCost = defaultTokenEstimator.countText(String(chars));
+  const bodyCost = Math.max(1, Math.ceil(chars / 4));
   return roleCost + 4 + bodyCost;
 }
 
@@ -51,7 +51,7 @@ export function countToolsTokens(tools: ModelToolSchema[]): number {
   for (const t of tools) {
     chars += t.name.length + t.description.length + JSON.stringify(t.inputSchema).length;
   }
-  return defaultTokenEstimator.countText("tools:") + defaultTokenEstimator.countText(String(chars));
+  return defaultTokenEstimator.countText("tools:") + Math.max(1, Math.ceil(chars / 4));
 }
 
 export interface ContextUsage {
